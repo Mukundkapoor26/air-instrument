@@ -1,0 +1,631 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Air Instrument</title>
+<style>
+  :root { --w:#fff; --mid:rgba(255,255,255,.55); --low:rgba(255,255,255,.14); --pad:max(16px, env(safe-area-inset-left)); }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html, body { margin:0; height:100%; background:#000; color:var(--w); overflow:hidden; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size:13px; }
+  video { display:none; }
+  #gl, #cv { position:fixed; inset:0; width:100vw; height:100vh; }
+  #cv { touch-action:none; }
+  .top { position:fixed; top:max(16px, env(safe-area-inset-top)); left:var(--pad); right:var(--pad); display:flex; justify-content:space-between; align-items:center; pointer-events:none; text-shadow:0 1px 8px rgba(0,0,0,.6); }
+  .brand span, #note { color:var(--mid); }
+  .dock { position:fixed; left:50%; transform:translateX(-50%); bottom:max(16px, env(safe-area-inset-bottom)); width:min(600px, calc(100% - 32px));
+          background:rgba(0,0,0,.45); backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px); border:1px solid var(--low); border-radius:18px; padding:12px; display:grid; gap:10px; }
+  .dock > * { min-width:0; }
+  .row { display:flex; align-items:center; gap:8px; }
+  .lineup { flex:1; min-width:0; display:flex; gap:6px; overflow-x:auto; scrollbar-width:none; }
+  .lineup::-webkit-scrollbar { display:none; }
+  button { font:inherit; color:var(--w); background:transparent; border:1px solid var(--low); border-radius:999px; min-height:34px; padding:0 12px; cursor:pointer; white-space:nowrap; }
+  button:active { transform:scale(.96); }
+  .chip { flex:none; color:var(--mid); }
+  .chip.on { background:var(--w); color:#000; border-color:var(--w); }
+  .arrow { width:34px; padding:0; flex:none; }
+  .seg { display:flex; border:1px solid var(--low); border-radius:999px; padding:2px; }
+  .seg button { border:0; min-height:28px; padding:0 10px; color:var(--mid); }
+  .seg button.on { background:var(--w); color:#000; }
+  .toggle { color:var(--mid); } .toggle.on { color:var(--w); border-color:var(--mid); }
+  .spacer { flex:1; }
+  .hint { color:var(--mid); font-size:11px; text-align:center; line-height:1.5; }
+  body.clean .dock, body.clean .top { display:none; }
+  @media (max-width:480px) { .hint { display:none; } .seg button { padding:0 8px; } .dock { padding:10px; } }
+  #start { position:fixed; inset:0; z-index:10; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:22px; padding:24px; text-align:center; background:#000; }
+  #start pre { margin:0; color:var(--mid); font-size:12px; }
+  #start h1 { margin:0; font-weight:normal; font-size:26px; }
+  #start h1 span { color:var(--mid); }
+  #start p { margin:0; color:var(--mid); max-width:360px; line-height:1.6; }
+  #start .btns { display:flex; gap:10px; flex-wrap:wrap; justify-content:center; }
+  #go { background:var(--w); color:#000; border:0; min-height:44px; padding:0 26px; font-size:14px; }
+  #mouse { min-height:44px; padding:0 20px; }
+  #status { font-size:11px; }
+</style>
+</head>
+<body>
+<video id="cam" playsinline muted></video>
+<canvas id="gl"></canvas>
+<canvas id="cv"></canvas>
+
+<div class="top"><div class="brand">air<span>/</span>instrument</div><div id="note"></div></div>
+
+<div class="dock">
+  <div class="row">
+    <button class="arrow" id="prev" aria-label="previous sound">‹</button>
+    <div class="lineup" id="sounds"></div>
+    <button class="arrow" id="next" aria-label="next sound">›</button>
+  </div>
+  <div class="row">
+    <div class="seg" id="strings"><button data-n="1" class="on">1</button><button data-n="3">3</button><button data-n="6">6</button></div>
+    <span style="color:var(--mid)">strings</span>
+    <span class="spacer"></span>
+    <button class="toggle on" id="tSnap">snap</button>
+    <button class="toggle" id="tMinor">minor</button>
+  </div>
+  <div class="hint">swipe a fingertip through the string to play · pinch an end to move it, let go and it stays · pinch the middle to move the whole string</div>
+</div>
+
+<div id="start">
+<pre>·  ─  ─  ∿  ∿  ∿  ∿  ∿  ─  ─  ·</pre>
+  <h1>air<span>/</span>instrument</h1>
+  <p>A string hangs in the air in front of you. Swipe a finger through it to play. Pinch an end to stretch it and change the note.</p>
+  <div class="btns"><button id="go">start camera</button><button id="mouse">play with mouse</button></div>
+  <p id="status">loading…</p>
+</div>
+
+<script type="module">
+import { FilesetResolver, HandLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const video=document.getElementById('cam'), cv=document.getElementById('cv'), ctx=cv.getContext('2d');
+const statusEl=document.getElementById('status');
+
+// ---------- sounds ----------
+// mode 0 = plucked string (Karplus-Strong physical model), 1 = saw synth
+const SOUNDS=[
+  { name:'clean', mode:0, bright:.55, damp:.996,  drive:0,  buzz:0, lp:9000, wet:.25, mul:1 },
+  { name:'rock',  mode:0, bright:.85, damp:.9985, drive:28, buzz:0, lp:4200, wet:.15, mul:1, power:true },
+  { name:'bass',  mode:0, bright:.35, damp:.998,  drive:2,  buzz:0, lp:1600, wet:.08, mul:.5 },
+  { name:'sitar', mode:0, bright:.95, damp:.9975, drive:4,  buzz:1, lp:7000, wet:.35, mul:1 },
+  { name:'harp',  mode:0, bright:.5,  damp:.999,  drive:0,  buzz:0, lp:8000, wet:.55, mul:2 },
+  { name:'glass', mode:0, bright:.98, damp:.9993, drive:0,  buzz:0, lp:11000, wet:.6, mul:4 },
+  { name:'synth', mode:1, env:.99985, drive:1, buzz:0, lp:5000, wet:.35, mul:1 },
+];
+let soundIdx=0, nStrings=1, snap=true, minor=false;
+
+// ---------- audio engine ----------
+const WORKLET=`
+const SIZE=8192, MASK=SIZE-1;
+class Voice{ constructor(){ this.buf=new Float32Array(SIZE); this.w=0; this.d=200; this.td=200; this.lp=0; this.ph=0; this.env=0; this.f=220; this.tf=220; this.flp=0; } }
+class Strings extends AudioWorkletProcessor{
+  constructor(){ super(); this.v=Array.from({length:6},()=>new Voice()); this.cfg={mode:0,bright:.5,damp:.996,env:.9998};
+    this.port.onmessage=e=>{ const m=e.data;
+      if(m.t==='cfg') this.cfg=m.c;
+      else if(m.t==='f') m.f.forEach((f,i)=>{ const v=this.v[i]; v.tf=f; v.td=Math.min(SIZE-2,sampleRate/f); });
+      else if(m.t==='pluck'){ const v=this.v[m.i]; const c=this.cfg;
+        if(c.mode===0){ v.d=v.td; const N=Math.max(2,Math.round(v.d)); const p=Math.min(.95,Math.max(.05,m.pos));
+          for(let k=0;k<N;k++){ const x=k/N; const tri=x<p?x/p:(1-x)/(1-p);
+            const idx=(v.w-N+k+SIZE)&MASK; v.buf[idx]+=((tri-.5)*.9+(Math.random()*2-1)*.45)*m.vel; } }
+        else { v.env=m.vel; v.f=v.tf; }
+      } };
+  }
+  process(_,outputs){
+    const out=outputs[0], L=out[0]; const c=this.cfg;
+    for(let n=0;n<L.length;n++){
+      let sum=0;
+      for(const v of this.v){
+        if(c.mode===0){
+          v.d+=(v.td-v.d)*.0015;
+          let r=v.w-v.d; if(r<0) r+=SIZE; const i0=r|0, fr=r-i0;
+          const s=v.buf[i0]*(1-fr)+v.buf[(i0+1)&MASK]*fr;
+          v.lp+=c.bright*(s-v.lp); v.buf[v.w]=v.lp*c.damp; v.w=(v.w+1)&MASK; sum+=s;
+        } else if(v.env>1e-4){
+          v.f+=(v.tf-v.f)*.002; v.ph+=v.f/sampleRate; if(v.ph>=1) v.ph-=1;
+          const s=2*v.ph-1; v.flp+=(.03+v.env*.45)*(s-v.flp); sum+=v.flp*v.env; v.env*=c.env;
+        }
+      }
+      sum*=.6; for(let ch=0;ch<out.length;ch++) out[ch][n]=sum;
+    }
+    return true;
+  }
+}
+registerProcessor('strings',Strings);`;
+let ac, node, shaper, lowpass, wetG, dryG, an, anBuf, level=0;
+async function initAudio(){
+  if(ac) return;
+  ac=new AudioContext({ latencyHint:'interactive' });
+  await ac.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET],{type:'application/javascript'})));
+  node=new AudioWorkletNode(ac,'strings',{ outputChannelCount:[2] });
+  const body=ac.createBiquadFilter(); body.type='peaking'; body.frequency.value=190; body.Q.value=1.1; body.gain.value=4;
+  const pres=ac.createBiquadFilter(); pres.type='peaking'; pres.frequency.value=2600; pres.Q.value=.9; pres.gain.value=2.5;
+  shaper=ac.createWaveShaper(); shaper.oversample='4x';
+  lowpass=ac.createBiquadFilter(); lowpass.type='lowpass'; lowpass.Q.value=.7;
+  const rev=ac.createConvolver(); rev.buffer=impulse(2.8);
+  wetG=ac.createGain(); dryG=ac.createGain();
+  const comp=ac.createDynamicsCompressor(); comp.threshold.value=-14; comp.ratio.value=4;
+  const master=ac.createGain(); master.gain.value=1.6;
+  const lim=ac.createDynamicsCompressor(); lim.threshold.value=-3; lim.knee.value=0; lim.ratio.value=20; lim.attack.value=.001; lim.release.value=.12;
+  const out=ac.createGain(); out.gain.value=.9;
+  node.connect(body); body.connect(pres); pres.connect(shaper); shaper.connect(lowpass);
+  lowpass.connect(dryG); lowpass.connect(rev); rev.connect(wetG);
+  dryG.connect(comp); wetG.connect(comp); comp.connect(master); master.connect(lim); lim.connect(out); out.connect(ac.destination);
+  an=ac.createAnalyser(); an.fftSize=1024; out.connect(an); anBuf=new Float32Array(an.fftSize);
+  window.airLevel=()=>{ an.getFloatTimeDomainData(anBuf); let p=0; for(const v of anBuf) p=Math.max(p,Math.abs(v)); return { state:ac.state, peak:+p.toFixed(3) }; };
+  applySound();
+}
+function impulse(sec){ const len=ac.sampleRate*sec, b=ac.createBuffer(2,len,ac.sampleRate);
+  for(let c=0;c<2;c++){ const d=b.getChannelData(c); for(let i=0;i<len;i++) d[i]=(Math.random()*2-1)*Math.pow(1-i/len,3); } return b; }
+function curve(drive,buzz){ const n=2048, c=new Float32Array(n);
+  for(let i=0;i<n;i++){ let x=i/(n-1)*2-1;
+    if(buzz) x = x>0 ? x : x*.55 + .08*Math.sin(x*40)*Math.abs(x);
+    c[i]= drive>0 ? Math.tanh(x*(1+drive))/Math.tanh(1+drive) : x; }
+  return c; }
+function applySound(){
+  const s=SOUNDS[soundIdx];
+  document.querySelectorAll('#sounds button').forEach((b,i)=>b.classList.toggle('on',i===soundIdx));
+  if(!ac) return;
+  node.port.postMessage({ t:'cfg', c:{ mode:s.mode, bright:s.bright||.5, damp:s.damp||.996, env:s.env||.9998 } });
+  shaper.curve=curve(s.drive,s.buzz);
+  lowpass.frequency.setTargetAtTime(s.lp,ac.currentTime,.02);
+  wetG.gain.setTargetAtTime(s.wet,ac.currentTime,.05); dryG.gain.setTargetAtTime(1-s.wet*.5,ac.currentTime,.05);
+}
+
+// ---------- pitch + colour ----------
+const NAMES=['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+const PENTA_MIN=[0,3,5,7,10], PENTA_MAJ=[0,2,4,7,9];
+const CHORDS={1:[0],3:[0,7,12],6:[0,7,12,16,19,24]};
+function snapMidi(m){ const sc=minor?PENTA_MIN:PENTA_MAJ; const base=Math.floor((m-57)/12)*12+57; let best=m,bd=99;
+  for(let o=-12;o<=12;o+=12) for(const s of sc){ const c=base+o+s; if(Math.abs(c-m)<bd){bd=Math.abs(c-m);best=c;} } return best; }
+let W=0,H=0,U=1; // buffer size, and 1% of the short side
+function rootMidi(len){ const ref=.35*Math.max(W,H*1.2); const L=Math.max(.25*ref,Math.min(3*ref,len));
+  const f=220*(ref/L); const m=69+12*Math.log2(f/440); return snap?snapMidi(Math.round(m)):m; }
+const mtof=m=>440*Math.pow(2,(m-69)/12);
+const noteName=m=>{ const r=Math.round(m); return NAMES[((r%12)+12)%12]+(Math.floor(r/12)-1); };
+// every note owns a colour: the 12 pitch classes walk the colour wheel, octaves nudge it
+const noteHue=m=>((((Math.round(m)%12)+12)%12)*30+Math.floor(Math.round(m)/12)*14+300)%360;
+function intervals(){ const c=CHORDS[nStrings].slice(); if(minor&&nStrings===6) c[3]=15; return c; }
+
+// ---------- smoothing ----------
+class LowPass { constructor(){this.y=null;} f(x,a){ this.y=this.y===null?x:a*x+(1-a)*this.y; return this.y; } }
+class OneEuro { constructor(mc=1.4,b=.08){ this.mc=mc; this.b=b; this.x=new LowPass(); this.dx=new LowPass(); this.last=null; }
+  a(c,dt){ const tau=1/(2*Math.PI*c); return 1/(1+tau/dt); }
+  filter(v,t){ if(this.last===null||t-this.last>400){ this.last=t; this.prev=v; this.x.y=null; this.dx.y=null; return this.x.f(v,1); }
+    const dt=Math.max(1e-3,(t-this.last)/1000); this.last=t; const d=(v-this.prev)/dt; this.prev=v;
+    const ed=this.dx.f(d,this.a(1,dt)); return this.x.f(v,this.a(this.mc+this.b*Math.abs(ed),dt)); } }
+const mkP=()=>({x:new OneEuro(),y:new OneEuro(),v:null});
+const fp=(p,x,y,t)=>(p.v={x:p.x.filter(x,t),y:p.y.filter(y,t)});
+const mkHand=()=>({ pinchP:mkP(), tips:{8:mkP(),12:mkP(),16:mkP()}, trails:{8:[],12:[],16:[]}, lm:null, pinch:false, grab:null, lastSeen:-1e9, center:null });
+const hands={L:mkHand(),R:mkHand()}; const HOLD=250;
+
+// ---------- the string: fixed in the air, in screen fractions ----------
+const ends={ a:{x:.22,y:.5}, b:{x:.78,y:.5} };
+let A={x:0,y:0}, B={x:0,y:0}, freeMode=false, mouseGrab=null;
+let strs=[], sparks=[], ripples=[], notePop=null, fieldHue=270, fieldHueS=270, energy=0, styleFlash=0;
+const pluckers=new Map();
+const STYLE_NAMES=['silk','spectrum','silk flame','mandala','iridescent','prism','pastel smear'];
+const gapU=()=>nStrings===3?7:nStrings===6?5.5:0; // room between strings, so one can be played alone
+
+function stringGeom(i){
+  const dx=B.x-A.x, dy=B.y-A.y, L=Math.hypot(dx,dy)||1, nx=-dy/L, ny=dx/L;
+  const off=(i-(nStrings-1)/2)*U*gapU();
+  return { a:{x:A.x+nx*off,y:A.y+ny*off}, b:{x:B.x+nx*off,y:B.y+ny*off}, nx, ny, L };
+}
+function pluck(i,pos,vel){
+  const s=strs[i], now=performance.now(); if(now-s.lastPluck<80) return; s.lastPluck=now;
+  s.amp=Math.min(1,.35+vel); s.pos=pos;
+  const v=Math.min(1,.3+vel*.9);
+  if(node){ node.port.postMessage({t:'pluck',i,pos,vel:v});
+    if(SOUNDS[soundIdx].power&&nStrings===1){ node.port.postMessage({t:'pluck',i:4,pos,vel:v*.8}); node.port.postMessage({t:'pluck',i:5,pos,vel:v*.6}); } }
+  const g=stringGeom(i), p={x:g.a.x+(g.b.x-g.a.x)*pos, y:g.a.y+(g.b.y-g.a.y)*pos}, hue=noteHue(s.midi);
+  for(let k=0;k<22;k++){ const a=Math.random()*6.28, sp=U*(.15+Math.random()*1.1)*(.5+vel); sparks.push({x:p.x,y:p.y,vx:Math.cos(a)*sp,vy:Math.sin(a)*sp,life:1,hue:hue+Math.random()*70-35}); }
+  ripples.push({x:p.x,y:p.y,t:now,hue}); if(ripples.length>8) ripples.shift();
+  energy=Math.min(2.4,energy+.7+vel); fieldHue=hue;
+  notePop={ text:noteName(s.midi), t:now, hue };
+  document.getElementById('note').textContent=noteName(s.midi)+' · '+SOUNDS[soundIdx].name;
+}
+function checkPluck(id,p){
+  const prev=pluckers.get(id); pluckers.set(id,p); if(!prev) return;
+  const speed=Math.hypot(p.x-prev.x,p.y-prev.y); if(speed<U*.15||speed>U*40) return;
+  for(let i=0;i<nStrings;i++){
+    const g=stringGeom(i), ux=(g.b.x-g.a.x)/g.L, uy=(g.b.y-g.a.y)/g.L;
+    const side=q=>(g.b.x-g.a.x)*(q.y-g.a.y)-(g.b.y-g.a.y)*(q.x-g.a.x);
+    const s0=side(prev), s1=side(p); if(s0===0||Math.sign(s0)===Math.sign(s1)) continue;
+    const f=s0/(s0-s1), cx=prev.x+(p.x-prev.x)*f, cy=prev.y+(p.y-prev.y)*f;
+    const t=((cx-g.a.x)*ux+(cy-g.a.y)*uy)/g.L;
+    if(t>.02&&t<.98) pluck(i,t,Math.min(1,speed/(U*4)));
+  }
+}
+// grab: pinch near an end moves that end; pinch on the string body moves the whole string
+function tryGrab(p){
+  const pa={x:ends.a.x*W,y:ends.a.y*H}, pb={x:ends.b.x*W,y:ends.b.y*H};
+  const taken=new Set([hands.L.grab,hands.R.grab,mouseGrab].filter(Boolean).map(g=>g.key));
+  const da=Math.hypot(p.x-pa.x,p.y-pa.y), db=Math.hypot(p.x-pb.x,p.y-pb.y), R=U*9;
+  if(da<R&&da<=db&&!taken.has('a')) return {key:'a'};
+  if(db<R&&!taken.has('b')) return {key:'b'};
+  const dx=pb.x-pa.x, dy=pb.y-pa.y, L2=dx*dx+dy*dy||1, t=Math.max(0,Math.min(1,((p.x-pa.x)*dx+(p.y-pa.y)*dy)/L2));
+  const d=Math.hypot(pa.x+dx*t-p.x,pa.y+dy*t-p.y);
+  if(d<U*4&&taken.size===0) return {key:'both', oa:{x:pa.x-p.x,y:pa.y-p.y}, ob:{x:pb.x-p.x,y:pb.y-p.y}};
+  return null;
+}
+const clamp01=(v,lo=.03,hi=.97)=>Math.min(hi,Math.max(lo,v));
+function moveGrab(g,p){
+  if(g.key==='both'){ ends.a={x:clamp01((p.x+g.oa.x)/W),y:clamp01((p.y+g.oa.y)/H)}; ends.b={x:clamp01((p.x+g.ob.x)/W),y:clamp01((p.y+g.ob.y)/H)}; }
+  else ends[g.key]={x:clamp01(p.x/W),y:clamp01(p.y/H)};
+}
+
+// ---------- GPU visuals: every wave, string and end is drawn by this shader ----------
+const glc=document.getElementById('gl');
+const gl=glc.getContext('webgl',{antialias:false,premultipliedAlpha:false});
+const FS=`
+precision highp float;
+uniform vec2 uRes; uniform float uPx, uT, uU, uN, uStyle, uEnergy, uLevel, uFieldHue, uHasVid, uFlash;
+uniform vec2 uA, uB, uGrab;
+uniform float uAmp[6], uPhase[6], uHue[6], uPos[6];
+uniform vec4 uRip[8];
+uniform sampler2D uVid, uFFT; uniform vec4 uVidR; uniform float uGap;
+
+vec3 hcol(float h, float s){ vec3 c=clamp(abs(mod(h*6.+vec3(0.,4.,2.),6.)-3.)-1.,0.,1.); return mix(vec3(1.),c,s); }
+float hash(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453); }
+float noise(vec2 p){ vec2 i=floor(p), f=fract(p); f=f*f*(3.-2.*f);
+  return mix(mix(hash(i),hash(i+vec2(1.,0.)),f.x), mix(hash(i+vec2(0.,1.)),hash(i+vec2(1.,1.)),f.x), f.y); }
+float fbm(vec2 p){ float s=0., a=.5; for(int i=0;i<4;i++){ s+=a*noise(p); p*=2.03; a*=.5; } return s; }
+float silkF(float xu, float v, float amp, float t){
+  float w=fbm(vec2(xu*.05+t*.12,v*.08-t*.2))*6.;
+  float f=v*.35+w+amp*.08*sin(xu/10.+t*1.2);
+  return pow(abs(sin(f*3.14159)),10.)+.35*pow(abs(sin(f*3.14159*.5+1.)),4.);
+}
+
+void main(){
+  vec2 p=vec2(gl_FragCoord.x, uRes.y-gl_FragCoord.y)/uPx;
+  float U=uU, t=uT, E=uEnergy, fh=uFieldHue;
+  vec2 d=uB-uA; float L=max(length(d),1.); vec2 dir=d/L, n=vec2(-dir.y,dir.x);
+  vec2 rel=p-uA; float x=dot(rel,dir), y=dot(rel,n); float u=x/L, xu=x/U;
+
+  // plucks send shockwaves that bend space and colour
+  // plucks don't draw anything themselves: they send a ripple through space that bends and brightens the waves
+  float ripple=0., lift=0.;
+  for(int k=0;k<8;k++){ vec4 r=uRip[k]; if(r.z<0.||r.z>2.2) continue;
+    float dist=length(p-r.xy); float R=r.z*U*55.; float w=U*(3.+r.z*6.);
+    float fade=pow(1.-r.z/2.2,2.);
+    float ring=exp(-pow((dist-R)/w,2.))*fade;
+    ripple+=ring*sin((dist-R)/(U*2.2));
+    lift+=ring;
+  }
+  vec3 ripCol=vec3(0.);
+  float v=(y+ripple*U*4.)/U;
+  float inside=smoothstep(0.,.03,u)*smoothstep(1.,.97,u);
+  float ext=exp(-pow(max(0.,max(-u,u-1.))*L/(U*24.),2.));
+  float tp=.35+.65*sin(3.14159*clamp(u,0.,1.));
+  float amp=(2.+E*7.+uLevel*22.)*ext*tp;
+  vec3 col=vec3(0.);
+
+  if(uStyle<.5){ // silk: hundreds of fine threads flowing around the string, like contour lines of a moving field
+    float f=v*.42+amp*.11*sin(xu/9.+t*.9)+.7*sin(xu/23.-t*.5+v*.07)+fbm(vec2(xu*.03+t*.05,v*.04-t*.08))*2.4;
+    float th=pow(abs(sin(f*3.14159)),28.);
+    float th2=pow(abs(sin(f*3.14159*.5+.7)),60.)*.6;
+    float band=exp(-abs(v)/(8.+amp*1.2))*ext;
+    col+=hcol(fh+f*.015,.38)*(th*.55+th2)*band*(.7+E*.4); }
+  else if(uStyle<1.5){ // spectrum: retro media-player bars driven by the real sound, mirrored over the string
+    float nb=48., bi=floor(clamp(u,0.,.999)*nb), bu=fract(clamp(u,0.,.999)*nb);
+    vec4 fx=texture2D(uFFT,vec2((bi+.5)/nb,.5));
+    float h=.6+fx.r*9.*(1.+E*.15), pk=.6+fx.g*9.*(1.+E*.15);
+    float av=abs(v);
+    float inBar=step(.22,bu)*step(bu,.78)*inside;
+    float seg=step(.45,fract(av/.9));
+    float lit=step(av,h)*inBar*seg;
+    float hn=clamp(av/9.,0.,1.);
+    col+=mix(hcol(fh,.5)*.8,hcol(fh+.06,.15),hn)*lit*(.28+hn*.35);
+    col+=vec3(1.)*exp(-pow((av-pk)*4.,2.))*inBar*.55;          // falling peak caps
+    float wf=(texture2D(uFFT,vec2(u,.5)).b-.5)*22.;            // the live waveform as a thin scope line
+    col+=hcol(fh+.08,.3)*exp(-pow((v-wf)*1.6,2.))*inside*.5;
+    }
+  else if(uStyle<2.5){ // silk flame: soft ribbons of light, warm at the heart, cool blue at the edges, split into colour at the rims
+    float rr=silkF(xu,v-.22,amp,t), rg=silkF(xu,v,amp,t), rb=silkF(xu,v+.22,amp,t);
+    float heat=exp(-abs(v)/(2.4+amp*.35));
+    vec3 warm=mix(vec3(.15,.3,1.),vec3(1.,.38,.3),pow(heat,.6));
+    warm=mix(warm,vec3(1.,.88,.78),heat*heat*.55);
+    col+=vec3(rr,rg,rb)*warm*(1.1+E*.45)*ext; }
+  else if(uStyle<3.5){ // mandala: glass-like interference folded into a turning rosette around the string centre
+    vec2 c=(uA+uB)*.5; vec2 q=(p-c)/U; float r=length(q), a=atan(q.y,q.x)-atan(dir.y,dir.x);
+    float R0=L/(2.*U);
+    float ph=sin(r*1.05-t*2.2)+cos(a*12.+r*.16+t*.35)+sin(r*.35+cos(a*6.-t*.5)*2.+E);
+    float lines=pow(.5+.5*cos(ph*3.14159),16.);
+    float mask=exp(-pow(max(0.,r-R0*.8)/4.,2.))*(.12+.88*exp(-abs(v)/(6.+amp*.8)));
+    col+=hcol(fh+ph*.04,.45)*lines*mask*(.35+E*.35); }
+  else if(uStyle<4.5){ // iridescent: a web of thin rainbow filaments with twinkling dust
+    for(int k=0;k<6;k++){ float fk=float(k);
+      float fy=(fbm(vec2(xu*.09+fk*3.7,t*.5+fk*1.3))-.5)*(7.+amp*1.3)+(noise(vec2(xu*.6+fk*9.,t*2.))-.5)*1.1;
+      float fl=v-fy;
+      vec3 fd=abs(vec3(fl-.16,fl,fl+.16));
+      vec3 strand=.009/(fd*fd+.009);
+      vec3 iri=.55+.45*cos(6.2832*(xu*.012+fk*.19+t*.05+vec3(0.,.33,.67)));
+      col+=strand*iri*(.5+E*.25)*ext; }
+    vec2 gc=floor(vec2(xu,v)*1.1); float hh=hash(gc);
+    vec2 fp2=fract(vec2(xu,v)*1.1)-.5;
+    float tw=step(.92,hh)*exp(-dot(fp2,fp2)*45.)*(.5+.5*sin(t*4.+hh*50.));
+    col+=vec3(1.)*tw*exp(-abs(v)/5.)*ext*(.7+E*.4); }
+  else if(uStyle<5.5){ // prism: interference rainbows between the two ends
+    float d1=length(p-uA)/U, d2=length(p-uB)/U;
+    float ph=sin(d1*1.1-t*3.)+sin(d2*1.1-t*3.3)+sin(v*.8+xu*.05-t);
+    float band=exp(-abs(v)/(5.+amp*1.5))*ext;
+    float lines=pow(.5+.5*cos(ph*3.14159),6.);
+    col+=hcol(fh+ph*.14+u*.25,.95)*lines*band*(.55+E*.5); }
+  else { // pastel smear: dreamy streaks dragged out of the string
+    float sx=xu*.22+fbm(vec2(xu*.05,t*.15))*3.;
+    float sv=abs(v)*.035;
+    float n1=fbm(vec2(sx,sv-t*.25)), n2=fbm(vec2(sx*1.7+5.,sv*1.3+t*.18));
+    vec3 c1=mix(vec3(.42,.58,1.),vec3(1.,.55,.85),smoothstep(.3,.7,n1));
+    c1=mix(c1,vec3(1.,.55,.25),smoothstep(.55,.8,n2)*.8);
+    c1=mix(c1,vec3(1.,.95,.5),smoothstep(.7,.85,n1*n2*1.8)*.7);
+    c1=mix(c1,vec3(1.),smoothstep(.6,.9,n2)*.5);
+    float body=exp(-abs(v)/(2.6+amp*.5+n1*3.));
+    col+=c1*body*(1.35+E*.35)*ext; }
+
+  // keep every effect tight around the strings: nothing spills across the screen
+  float spread=(uN-1.)*uGap*.5;
+  float showpiece=(abs(uStyle-2.)<.5||abs(uStyle-4.)<.5||uStyle>5.5)?1.:0.;
+  float bandW=(uStyle>.5&&uStyle<1.5?9.:2.6+min(amp,10.)*.3+showpiece*2.)+spread*.8;
+  float along=smoothstep(-.015,.05,u)*smoothstep(1.015,.95,u);
+  col*=exp(-pow(max(0.,abs(v)-spread*.6)/bandW,2.))*along*.85;
+
+  // metal strings: a thin polished wire with a specular line and rainbow-split edges,
+  // wrapped in chrome filaments that come alive when the string rings
+  float sumAmp=0.;
+  for(int i=0;i<6;i++){ if(float(i)>=uN) break;
+    float off=(float(i)-(uN-1.)*.5)*uGap;
+    float uc=clamp(u,0.,1.), pos=clamp(uPos[i],.05,.95);
+    float shape=uc<pos?uc/pos:(1.-uc)/(1.-pos);
+    float am=uAmp[i]; sumAmp+=am;
+    float a=am*5.;
+    float dsp=a*sin(uPhase[i])*(.6*shape+.4*sin(3.14159*uc))+a*.25*sin(6.2832*uc)*sin(uPhase[i]*2.1)+sin(uc*3.14159)*.25*sin(t*2.+uc*6.+float(i));
+    float sv=v-off-dsp;
+    // chromatic dispersion: red, green and blue sit a hair apart, more so while it vibrates
+    float sp=.09+am*.35;
+    vec3 dRGB=abs(vec3(sv-sp,sv,sv+sp));
+    vec3 wire=exp(-dRGB*dRGB*16.);
+    vec3 halo=.05/(dRGB*dRGB*.7+.05)*(.18+am*.8);
+    float spec=exp(-pow((sv+.06)*22.,2.))*(.7+.3*sin(xu*.4-t*3.));        // the polished highlight
+    vec3 tint=hcol(uHue[i]+uc*.04,.35);
+    col+=(wire*mix(vec3(.85),tint,.4)*1.2+halo*tint+vec3(spec))*inside;
+    // chrome filaments: thin noisy strands hugging the wire, iridescent like oil on metal
+    for(int k=0;k<3;k++){ float fk=float(k);
+      float fy=(fbm(vec2(xu*.16+fk*4.1+float(i)*7.,t*(.9+am*2.)+fk*2.))-.5)*(1.2+am*7.)*sin(3.14159*uc);
+      float fl=sv-fy;
+      vec3 fd=abs(vec3(fl-.12,fl,fl+.12));
+      vec3 strand=.006/(fd*fd+.006);
+      vec3 iri=.6+.4*cos(6.2832*(uc*1.3+fk*.27+t*.07+vec3(0.,.33,.67)));
+      col+=strand*iri*(.05+am*.9)*inside;
+    }
+  }
+  col*=1.+lift*.9;
+
+  // the two ends: simple bright dots with a soft halo and a short flare along the string
+  for(int e=0;e<2;e++){
+    vec2 P=e==0?uA:uB; float gr=e==0?uGrab.x:uGrab.y;
+    vec2 q=(p-P)/U; float r=length(q); vec2 qa=vec2(dot(q,dir),dot(q,n));
+    float sc=1.+gr*.5;
+    float dot=smoothstep(.55*sc,.35*sc,r);
+    float halo=.12/(r*r/sc+.12)*.6;
+    float streak=exp(-abs(qa.y)*3.)*exp(-abs(qa.x)/(5.*sc))*.35;
+    col+=vec3(1.)*dot+hcol(uHue[0],.25)*(halo+streak);
+  }
+
+  col=1.-exp(-col*1.3);
+  vec3 bg=vec3(0.);
+  if(uHasVid>.5){ vec2 tv=vec2(1.-(p.x-uVidR.x)/uVidR.z,(p.y-uVidR.y)/uVidR.w); bg=texture2D(uVid,tv).rgb*.4; }
+  vec3 outc=bg+col*(1.-bg*.5)+vec3(uFlash)*.15;
+  gl_FragColor=vec4(outc,1.);
+}`;
+const VS=`attribute vec2 p; void main(){ gl_Position=vec4(p,0.,1.); }`;
+function sh(type,src){ const s=gl.createShader(type); gl.shaderSource(s,src); gl.compileShader(s); if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; }
+const prog=gl.createProgram(); gl.attachShader(prog,sh(gl.VERTEX_SHADER,VS)); gl.attachShader(prog,sh(gl.FRAGMENT_SHADER,FS)); gl.linkProgram(prog); gl.useProgram(prog);
+gl.bindBuffer(gl.ARRAY_BUFFER,gl.createBuffer()); gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,1,1]),gl.STATIC_DRAW);
+const ap=gl.getAttribLocation(prog,'p'); gl.enableVertexAttribArray(ap); gl.vertexAttribPointer(ap,2,gl.FLOAT,false,0,0);
+const Uf=n=>gl.getUniformLocation(prog,n);
+const vidTex=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,vidTex);
+for(const [k,v] of [[gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE],[gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE],[gl.TEXTURE_MIN_FILTER,gl.LINEAR],[gl.TEXTURE_MAG_FILTER,gl.LINEAR]]) gl.texParameteri(gl.TEXTURE_2D,k,v);
+gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,1,1,0,gl.RGBA,gl.UNSIGNED_BYTE,new Uint8Array([0,0,0,255]));
+gl.uniform1i(Uf('uVid'),0); gl.uniform1i(Uf('uFFT'),1);
+const fftTex=gl.createTexture(); gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,fftTex);
+for(const [k,v] of [[gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE],[gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE],[gl.TEXTURE_MIN_FILTER,gl.NEAREST],[gl.TEXTURE_MAG_FILTER,gl.NEAREST]]) gl.texParameteri(gl.TEXTURE_2D,k,v);
+gl.activeTexture(gl.TEXTURE0);
+const fftPix=new Uint8Array(256*4), bars=new Float32Array(48), peaks=new Float32Array(48); let freqBuf=null;
+function updateFFT(){
+  if(!an) return; if(!freqBuf) freqBuf=new Uint8Array(an.frequencyBinCount);
+  an.getByteFrequencyData(freqBuf);
+  for(let b=0;b<48;b++){ const lo=Math.round(1.5*Math.pow(190/1.5,b/48)), hi=Math.max(lo+1,Math.round(1.5*Math.pow(190/1.5,(b+1)/48)));
+    let m=0; for(let k=lo;k<hi;k++) m=Math.max(m,freqBuf[k]); const v=Math.pow(Math.max(0,(m/255-.4)/.6),1.4);
+    bars[b]=Math.max(v,bars[b]*.86); peaks[b]=Math.max(bars[b],peaks[b]-.012); }
+  for(let x=0;x<256;x++){ const b=Math.floor(x*48/256), w=anBuf[Math.floor(x/256*anBuf.length)]||0;
+    fftPix[x*4]=bars[b]*255; fftPix[x*4+1]=peaks[b]*255; fftPix[x*4+2]=Math.max(0,Math.min(255,(w*.5+.5)*255)); fftPix[x*4+3]=255; }
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,fftTex);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,256,1,0,gl.RGBA,gl.UNSIGNED_BYTE,fftPix);
+  gl.activeTexture(gl.TEXTURE0);
+}
+
+// ---------- camera + tracking ----------
+let landmarker;
+const ready=(async()=>{
+  const files=await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  const o=d=>({ baseOptions:{ modelAssetPath:"https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task", delegate:d },
+    runningMode:"VIDEO", numHands:2, minHandDetectionConfidence:.45, minHandPresenceConfidence:.4, minTrackingConfidence:.4 });
+  try{ landmarker=await HandLandmarker.createFromOptions(files,o("GPU")); }catch(e){ landmarker=await HandLandmarker.createFromOptions(files,o("CPU")); }
+  statusEl.textContent='ready';
+})().catch(()=>{ statusEl.textContent='hand tracker failed to load, mouse mode still works'; });
+
+function begin(){ document.getElementById('start').remove(); resize(); setStrings(nStrings); requestAnimationFrame(loop); }
+document.getElementById('go').onclick=async()=>{
+  await initAudio(); ac.resume();
+  try{ const st=await navigator.mediaDevices.getUserMedia({ video:{ width:{ideal:1280}, height:{ideal:720}, facingMode:'user' }, audio:false });
+    video.srcObject=st; await video.play(); await ready; }
+  catch(e){ statusEl.textContent='camera blocked, starting mouse mode'; freeMode=true; }
+  begin();
+};
+document.getElementById('mouse').onclick=async()=>{ await initAudio(); ac.resume(); freeMode=true; begin(); };
+
+// world coordinates are CSS pixels; the shader runs a little below retina for speed (glows are soft anyway)
+let vS=1, vX=0, vY=0, dpr=1, glPx=1;
+function resize(){
+  dpr=Math.min(devicePixelRatio||1,2); glPx=Math.min(devicePixelRatio||1,1.5)*.75;
+  W=innerWidth; H=innerHeight; U=Math.min(W,H)*.01;
+  cv.width=Math.round(W*dpr); cv.height=Math.round(H*dpr); ctx.setTransform(dpr,0,0,dpr,0,0);
+  glc.width=Math.round(W*glPx); glc.height=Math.round(H*glPx); gl.viewport(0,0,glc.width,glc.height);
+  const vw=video.videoWidth||1280, vh=video.videoHeight||720;
+  vS=Math.max(W/vw,H/vh); vX=(W-vw*vS)/2; vY=(H-vh*vS)/2;
+}
+addEventListener('resize',()=>W&&resize());
+const lmToScreen=p=>({ x:vX+(1-p.x)*(video.videoWidth||1280)*vS, y:vY+p.y*(video.videoHeight||720)*vS });
+
+function assign(found){
+  const out={}; if(found.length>=2){ const [a,b]=found.slice(0,2).sort((p,q)=>p.cx-q.cx); out.L=a; out.R=b; }
+  else if(found.length===1){ const f=found[0]; const l=hands.L.center, r=hands.R.center, now=performance.now();
+    const lA=l&&now-hands.L.lastSeen<800, rA=r&&now-hands.R.lastSeen<800;
+    if(lA&&rA) out[Math.hypot(f.cx-l.x,f.cy-l.y)<Math.hypot(f.cx-r.x,f.cy-r.y)?'L':'R']=f;
+    else if(lA) out[Math.hypot(f.cx-l.x,f.cy-l.y)<W*.25?'L':'R']=f;
+    else if(rA) out[Math.hypot(f.cx-r.x,f.cy-r.y)<W*.25?'R':'L']=f;
+    else out[f.cx<W/2?'L':'R']=f; }
+  return out;
+}
+
+// ---------- pointer ----------
+const toWorld=e=>({ x:e.clientX, y:e.clientY });
+cv.addEventListener('pointerdown',e=>{ const p=toWorld(e); const g=tryGrab(p);
+  if(g&&(g.key!=='both'||e.shiftKey)){ mouseGrab=g; cv.setPointerCapture(e.pointerId); return; }
+  pluckers.set('ptr'+e.pointerId,p); });
+cv.addEventListener('pointermove',e=>{ const p=toWorld(e); if(mouseGrab){ moveGrab(mouseGrab,p); return; } checkPluck('ptr'+e.pointerId,p); });
+addEventListener('pointerup',e=>{ mouseGrab=null; pluckers.delete('ptr'+e.pointerId); });
+
+// ---------- UI ----------
+document.getElementById('sounds').innerHTML=SOUNDS.map((s,i)=>`<button class="chip" data-i="${i}">${s.name}</button>`).join('');
+const pickSound=i=>{ soundIdx=i; applySound(); styleFlash=1; document.getElementById('note').textContent=SOUNDS[i].name+' · '+STYLE_NAMES[i]; };
+document.querySelectorAll('#sounds button').forEach(b=>b.onclick=()=>pickSound(+b.dataset.i));
+const shiftSound=d=>{ pickSound((soundIdx+d+SOUNDS.length)%SOUNDS.length); document.querySelectorAll('#sounds button')[soundIdx].scrollIntoView({inline:'center',block:'nearest'}); };
+document.getElementById('prev').onclick=()=>shiftSound(-1);
+document.getElementById('next').onclick=()=>shiftSound(1);
+function setStrings(n){ nStrings=n; strs=Array.from({length:n},()=>({amp:0,pos:.5,lastPluck:0,midi:57,phase:Math.random()*6}));
+  document.querySelectorAll('#strings button').forEach(b=>b.classList.toggle('on',+b.dataset.n===n)); }
+document.querySelectorAll('#strings button').forEach(b=>b.onclick=()=>setStrings(+b.dataset.n));
+document.getElementById('tSnap').onclick=e=>{ snap=!snap; e.currentTarget.classList.toggle('on',snap); };
+document.getElementById('tMinor').onclick=e=>{ minor=!minor; e.currentTarget.classList.toggle('on',minor); };
+applySound();
+addEventListener('keydown',e=>{ const k=e.key.toLowerCase();
+  if(e.key==='ArrowRight') shiftSound(1); if(e.key==='ArrowLeft') shiftSound(-1);
+  if(['1','3','6'].includes(k)) setStrings(+k);
+  if(k==='h') document.body.classList.toggle('clean');
+  if(e.key===' '){ e.preventDefault(); for(let i=0;i<nStrings;i++) setTimeout(()=>pluck(i,.3,.6),i*35); }
+});
+
+// ---------- overlay: neon hands, sparks, note names ----------
+const hsl=(h,s,l,a)=>`hsla(${h},${s}%,${l}%,${a})`;
+const BONES=[[0,1,2,3,4],[0,5,6,7,8],[9,10,11,12],[13,14,15,16],[0,17,18,19,20],[5,9,13,17]];
+function zapWhite(a,b,alpha){ zap(a,b,0,alpha,true); }
+function zap(a,b,hue,alpha,white){
+  const n=8; ctx.beginPath(); ctx.moveTo(a.x,a.y);
+  for(let k=1;k<n;k++){ const u=k/n; ctx.lineTo(a.x+(b.x-a.x)*u+(Math.random()-.5)*U*1.6, a.y+(b.y-a.y)*u+(Math.random()-.5)*U*1.6); }
+  ctx.lineTo(b.x,b.y); ctx.strokeStyle=white?`rgba(255,255,255,${alpha})`:hsl(hue,100,80,alpha); ctx.lineWidth=Math.max(1,U*.15); ctx.stroke();
+}
+function drawHand(h,side,t){
+  const P=h.lm; if(!P) return;
+  ctx.save(); ctx.lineCap='round'; ctx.lineJoin='round';
+  ctx.strokeStyle='rgba(255,255,255,.45)'; ctx.lineWidth=Math.max(1.2,U*.16);
+  ctx.beginPath(); for(const chain of BONES) chain.forEach((j,k)=>k?ctx.lineTo(P[j].x,P[j].y):ctx.moveTo(P[j].x,P[j].y)); ctx.stroke();
+  ctx.fillStyle='rgba(255,255,255,.85)';
+  for(let j=0;j<21;j++){ ctx.beginPath(); ctx.arc(P[j].x,P[j].y,Math.max(1.3,U*.22),0,7); ctx.fill(); }
+  // the fingers that can play: a white dot with a short fading trail, so you can see them drag
+  for(const k of [8,12,16]){ if(h.pinch&&k===8) continue; const tr=h.trails[k]; if(tr.length<2) continue;
+    for(let q=1;q<tr.length;q++){ const a=q/tr.length; ctx.beginPath(); ctx.moveTo(tr[q-1].x,tr[q-1].y); ctx.lineTo(tr[q].x,tr[q].y);
+      ctx.strokeStyle=`rgba(255,255,255,${a*.5})`; ctx.lineWidth=U*.55*a; ctx.stroke(); }
+    const p=tr[tr.length-1];
+    ctx.fillStyle='#fff'; ctx.beginPath(); ctx.arc(p.x,p.y,U*.75,0,7); ctx.fill();
+    ctx.strokeStyle='rgba(0,0,0,.6)'; ctx.lineWidth=Math.max(1,U*.12); ctx.stroke(); }
+  if(h.pinch&&h.pinchP.v){ const p=h.pinchP.v;
+    ctx.strokeStyle='rgba(255,255,255,.95)'; ctx.lineWidth=Math.max(1.5,U*.2); ctx.beginPath(); ctx.arc(p.x,p.y,U*(h.grab?2.4:1.6),0,7); ctx.stroke(); }
+  ctx.restore();
+}
+
+// ---------- main loop ----------
+let lastVT=-1;
+function loop(now){
+  requestAnimationFrame(loop);
+  const t=now/1000;
+  if(an){ an.getFloatTimeDomainData(anBuf); let s=0; for(let i=0;i<anBuf.length;i+=4) s+=anBuf[i]*anBuf[i]; level+=(Math.sqrt(s/(anBuf.length/4))-level)*.25; }
+  energy*=.975; styleFlash*=.9;
+  let dh=((fieldHue-fieldHueS+540)%360)-180; fieldHueS=(fieldHueS+dh*.08+360)%360;
+
+  if(!freeMode && landmarker && video.currentTime!==lastVT){
+    lastVT=video.currentTime;
+    const res=landmarker.detectForVideo(video,now);
+    const found=(res.landmarks||[]).map(lm=>{ const P=lm.map(lmToScreen);
+      const size=Math.hypot(P[0].x-P[9].x,P[0].y-P[9].y);
+      return { lm:P, size, cx:(P[0].x+P[9].x)/2, cy:(P[0].y+P[9].y)/2 }; });
+    const as=assign(found);
+    for(const side of ['L','R']){ const h=hands[side], f=as[side];
+      if(!f){ if(now-h.lastSeen>HOLD){ h.grab=null; h.pinch=false; h.lm=null; for(const k in h.trails) h.trails[k]=[]; } continue; }
+      h.lastSeen=now; h.center={x:f.cx,y:f.cy};
+      h.lm=h.lm?f.lm.map((p,i)=>({x:h.lm[i].x+(p.x-h.lm[i].x)*.6,y:h.lm[i].y+(p.y-h.lm[i].y)*.6})):f.lm;
+      const th=f.lm[4], ix=f.lm[8], d=Math.hypot(th.x-ix.x,th.y-ix.y)/f.size;
+      const pp=fp(h.pinchP,(th.x+ix.x)/2,(th.y+ix.y)/2,now);
+      if(!h.pinch&&d<.28){ h.pinch=true; h.grab=tryGrab(pp); }
+      else if(h.pinch&&d>.42){ h.pinch=false; h.grab=null; } // let go: the string stays where it is
+      if(h.grab) moveGrab(h.grab,pp);
+      for(const k of [8,12,16]){ const p=fp(h.tips[k],f.lm[k].x,f.lm[k].y,now);
+        const tr=h.trails[k]; tr.push(p); if(tr.length>12) tr.shift();
+        if(h.pinch&&k===8){ pluckers.delete(side+k); continue; }
+        checkPluck(side+k,p); }
+    }
+  }
+  A={x:ends.a.x*W,y:ends.a.y*H}; B={x:ends.b.x*W,y:ends.b.y*H};
+
+  const L=Math.hypot(B.x-A.x,B.y-A.y), root=rootMidi(L), iv=intervals(), mul=SOUNDS[soundIdx].mul;
+  strs.forEach((s,i)=>{ s.midi=root+iv[i]; s.phase+=(6+(s.midi-40)*.35)*.1; s.amp*=.968; });
+  const fs=strs.map(s=>mtof(s.midi)*mul); while(fs.length<4) fs.push(fs[0]);
+  if(nStrings<5){ fs[4]=mtof(root+7)*mul; fs[5]=mtof(root+12)*mul; }
+  if(node) node.port.postMessage({t:'f',f:fs});
+
+  // ---- GPU pass ----
+  const hasVid=!freeMode&&video.readyState>=2;
+  if(hasVid){ gl.bindTexture(gl.TEXTURE_2D,vidTex); gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,video); }
+  const pad6=f=>{ const a=new Float32Array(6); strs.forEach((s,i)=>a[i]=f(s)); return a; };
+  const rip=new Float32Array(32).fill(-1);
+  ripples.forEach((r,k)=>{ rip.set([r.x,r.y,(now-r.t)/1000,r.hue/360],k*4); });
+  const grabbed=key=>[hands.L.grab,hands.R.grab,mouseGrab].some(g=>g&&(g.key===key||g.key==='both'))?1:0;
+  gl.uniform2f(Uf('uRes'),glc.width,glc.height); gl.uniform1f(Uf('uPx'),glPx);
+  gl.uniform1f(Uf('uT'),t); gl.uniform1f(Uf('uU'),U); gl.uniform1f(Uf('uN'),nStrings); gl.uniform1f(Uf('uStyle'),soundIdx);
+  gl.uniform1f(Uf('uEnergy'),energy); gl.uniform1f(Uf('uLevel'),level); gl.uniform1f(Uf('uFieldHue'),fieldHueS/360);
+  gl.uniform1f(Uf('uHasVid'),hasVid?1:0); gl.uniform1f(Uf('uFlash'),styleFlash);
+  gl.uniform2f(Uf('uA'),A.x,A.y); gl.uniform2f(Uf('uB'),B.x,B.y); gl.uniform2f(Uf('uGrab'),grabbed('a'),grabbed('b'));
+  gl.uniform1fv(Uf('uAmp'),pad6(s=>s.amp)); gl.uniform1fv(Uf('uPhase'),pad6(s=>s.phase));
+  gl.uniform1fv(Uf('uHue'),pad6(s=>noteHue(s.midi)/360)); gl.uniform1fv(Uf('uPos'),pad6(s=>s.pos));
+  gl.uniform4fv(Uf('uRip'),rip);
+  gl.uniform4f(Uf('uVidR'),vX,vY,(video.videoWidth||1280)*vS,(video.videoHeight||720)*vS);
+  gl.uniform1f(Uf('uGap'),gapU()); updateFFT();
+  gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+
+  // ---- overlay ----
+  ctx.clearRect(0,0,W,H);
+  const hue0=noteHue(strs[0].midi);
+  ctx.save(); ctx.globalCompositeOperation='lighter';
+  // a fingertip near the string draws sparks to it before you play
+  for(const side of ['L','R']){ const h=hands[side]; if(!h.lm||h.grab||now-h.lastSeen>HOLD) continue;
+    for(const k of [8,12]){ if(h.pinch&&k===8) continue; const p=h.tips[k].v; if(!p) continue;
+      const dx=B.x-A.x, dy=B.y-A.y, L2=dx*dx+dy*dy||1, u=Math.max(0,Math.min(1,((p.x-A.x)*dx+(p.y-A.y)*dy)/L2));
+      const q={x:A.x+dx*u,y:A.y+dy*u}, dd=Math.hypot(q.x-p.x,q.y-p.y);
+      if(dd<U*8&&Math.random()<.6) zapWhite(p,q,.6*(1-dd/(U*8))); } }
+  strs.forEach((s,i)=>{ if(s.amp<.08) return; const g=stringGeom(i);
+    for(let k=0;k<3;k++){ const u=Math.random(); sparks.push({x:g.a.x+(g.b.x-g.a.x)*u,y:g.a.y+(g.b.y-g.a.y)*u,vx:(Math.random()-.5)*U*.08,vy:-U*(.05+Math.random()*.14),life:.7*s.amp,hue:noteHue(s.midi)+Math.random()*60}); } });
+  for(let i=sparks.length-1;i>=0;i--){ const p=sparks[i]; p.x+=p.vx; p.y+=p.vy; p.vx*=.95; p.vy*=.95; p.life-=.022;
+    if(p.life<=0){ sparks.splice(i,1); continue; } ctx.fillStyle=hsl(p.hue,45,85,p.life); const s=U*.35; ctx.fillRect(p.x-s/2,p.y-s/2,s,s); }
+  if(sparks.length>1200) sparks.splice(0,sparks.length-1200);
+  ctx.restore();
+  for(const side of ['L','R']) if(!freeMode&&now-hands[side].lastSeen<HOLD) drawHand(hands[side],side,t);
+
+  const cx=(A.x+B.x)/2, cy=(A.y+B.y)/2, ang=Math.atan2(B.y-A.y,B.x-A.x), nx=Math.sin(ang), ny=-Math.cos(ang);
+  ctx.font=`${Math.round(U*1.8)}px ui-monospace, Menlo, monospace`; ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillStyle='rgba(255,255,255,.8)'; ctx.fillText(noteName(strs[0].midi), cx+nx*U*(9+nStrings*1.2), cy+ny*U*(9+nStrings*1.2));
+  if(notePop){ const a=1-(now-notePop.t)/800; if(a<=0) notePop=null; else {
+    ctx.font=`${Math.round(U*4.5)}px ui-monospace, Menlo, monospace`; ctx.fillStyle=`rgba(255,255,255,${a})`;
+    ctx.fillText(notePop.text, cx-nx*U*(12+(1-a)*3), cy-ny*U*(12+(1-a)*3)); } }
+}
+</script>
+</body>
+</html>
