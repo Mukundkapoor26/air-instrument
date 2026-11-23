@@ -12,7 +12,7 @@ A string that hangs in the air in front of your webcam. Swipe a fingertip throug
 - **Tension mode (default):** stretching tightens the string like a tuning peg, so longer = higher. Turn it off for **length mode**, where shorter = higher, like fretting a guitar
 - Pinch empty air with both hands and pull them apart to draw a brand new string between them (up to 6), each tuned by its own length
 - Every string keeps its own sound: pick a sound and it applies to new strings and the one you last played, so clean and rock strings can ring side by side
-- Pinch the middle of a string to move the whole thing
+- Pinch the middle of a string to move the whole thing, or fling it to throw it away
 - High notes throw glitter, and the higher the note, the more stars
 - 1, 3 or 6 strings, tuned as a chord and spaced so you can pick one out
 - Snap to scale (major or minor pentatonic) so it always sounds musical
@@ -39,7 +39,9 @@ A string that hangs in the air in front of your webcam. Swipe a fingertip throug
 | Pinch an end / drag an end | Stretch it, which changes the note |
 | Both hands pinch empty air and pull apart / shift-drag | Draw a new string |
 | T | Tension vs length mode |
-| C | Clear back to one string |
+| Pinch a string's middle and throw it / shift-drag and fling | Remove that string |
+| Backspace | Remove the last string you played |
+| C | Reset to one string |
 | ← → | Change sound |
 | 1, 3, 6 | Number of strings |
 | Space | Strum |

@@ -64,7 +64,7 @@
     <button class="toggle on" id="tSnap">snap</button>
     <button class="toggle" id="tMinor">minor</button>
   </div>
-  <div class="hint">swipe a fingertip through a string to play · pinch an end and stretch to tune it · pinch empty air with both hands and pull apart to draw a new string · only index fingers play · mouse: shift-drag to draw · c clears</div>
+  <div class="hint">swipe a fingertip through a string to play · pinch an end and stretch to tune it · pinch empty air with both hands and pull apart to draw a new string · only index fingers play · pinch a string's middle and throw it to remove it · mouse: shift-drag to draw or throw · c resets</div>
 </div>
 
 <div id="start">
@@ -239,8 +239,9 @@ function pluck(i,pos,vel){
   document.getElementById('note').textContent=noteName(w.midi)+' · '+SOUNDS[w.sound].name;
 }
 function checkPluck(id,p){
-  const prev=pluckers.get(id); pluckers.set(id,p); if(!prev) return;
-  const speed=Math.hypot(p.x-prev.x,p.y-prev.y); if(speed<U*.15||speed>U*40) return;
+  const now=performance.now(), prev=pluckers.get(id); pluckers.set(id,{x:p.x,y:p.y,t:now});
+  if(!prev||now-prev.t>220) return; // the finger just appeared: nothing to compare with yet
+  const speed=Math.hypot(p.x-prev.x,p.y-prev.y); if(speed<U*.1) return;
   wires.forEach((w,i)=>{
     if(isHeld(i)) return;
     const g=geom(w), ux=(g.b.x-g.a.x)/g.L, uy=(g.b.y-g.a.y)/g.L;
@@ -279,16 +280,29 @@ function removeWire(i){
   for(const g of allGrabs()) if(g.w>i) g.w--;
   syncVoices();
   active=Math.min(active,wires.length-1);
-  if(!wires.length) setStrings(1);
 }
 function releaseGrab(g){
   if(!g) return;
   const w=wires[g.w];
-  if(g.creating&&w&&geom(w).L<U*6) removeWire(g.w); // a tiny pinch, not a string
+  if(g.creating&&w&&geom(w).L<U*6){ removeWire(g.w); return; } // a tiny pinch, not a string
+  // flung: a string held by its middle and let go fast flies off and disappears
+  if(w&&g.key==='both'&&Math.hypot(g.vx||0,g.vy||0)>U*110) throwWire(g.w,g.vx,g.vy);
+}
+let flying=[];
+function throwWire(i,vx,vy){
+  const w=wires[i], g=geom(w), hue=noteHue(w.midi);
+  flying.push({a:{...g.a},b:{...g.b},vx:vx/60,vy:vy/60,spin:(Math.random()-.5)*.08,life:1,hue});
+  for(let k=0;k<40;k++){ const u=Math.random(); sparks.push({x:g.a.x+(g.b.x-g.a.x)*u,y:g.a.y+(g.b.y-g.a.y)*u,vx:vx/90*(Math.random()*.8+.2)+(Math.random()-.5)*U*.4,vy:vy/90*(Math.random()*.8+.2)+(Math.random()-.5)*U*.4,life:1,hue:hue+Math.random()*60-30}); }
+  removeWire(i);
+  document.getElementById('note').textContent='string thrown away';
 }
 const clamp01=(v,lo=.02,hi=.98)=>Math.min(hi,Math.max(lo,v));
 function moveGrab(g,p){
   const w=wires[g.w]; if(!w) return;
+  // remember how fast the hand is moving, so a throw can be recognised on release
+  const now=performance.now();
+  if(g.lp){ const dt=Math.max(8,now-g.lt); g.vx=(g.vx||0)*.4+(p.x-g.lp.x)/dt*1000*.6; g.vy=(g.vy||0)*.4+(p.y-g.lp.y)/dt*1000*.6; }
+  g.lp={x:p.x,y:p.y}; g.lt=now;
   if(g.key==='both'){ w.a={x:clamp01((p.x+g.oa.x)/W),y:clamp01((p.y+g.oa.y)/H)}; w.b={x:clamp01((p.x+g.ob.x)/W),y:clamp01((p.y+g.ob.y)/H)}; }
   else w[g.key]={x:clamp01(p.x/W),y:clamp01(p.y/H)};
 }
@@ -426,7 +440,7 @@ void main(){
     float spec=exp(-pow((sv+.06)*22.,2.))*(.7+.3*sin(sxu*.4-t*3.));
     vec3 tint=hcol(uHue[i]+uc*.04,.35);
     col+=(wire*mix(vec3(.85),tint,.4)*1.2+halo*tint+vec3(spec))*sIn;
-    for(int k=0;k<3;k++){ float fk=float(k);
+    for(int k=0;k<3;k++){ float fk=float(k); if(k>0&&am<.03) break;
       float fy=(fbm(vec2(sxu*.16+fk*4.1+float(i)*7.,t*(.9+am*2.)+fk*2.))-.5)*(1.2+am*7.)*sin(3.14159*uc);
       float fl=sv-fy;
       vec3 fd=abs(vec3(fl-.12,fl,fl+.12));
@@ -559,6 +573,7 @@ addEventListener('keydown',e=>{ const k=e.key.toLowerCase();
   if(k==='h') document.body.classList.toggle('clean');
   if(k==='t') document.getElementById('tTension').click();
   if(k==='c') setStrings(1);
+  if(e.key==='Backspace'&&wires[active]){ e.preventDefault(); throwWire(active,0,-U*200); }
   if(e.key===' '){ e.preventDefault(); wires.forEach((_,i)=>setTimeout(()=>pluck(i,.3,.6),i*35)); }
 });
 
@@ -619,7 +634,8 @@ function loop(now){
       // only the index fingertip plays, so other fingers can't pluck by accident
       const p8=fp(h.tips[8],f.lm[8].x,f.lm[8].y,now);
       const tr=h.trails[8]; tr.push(p8); if(tr.length>12) tr.shift();
-      if(h.pinch) pluckers.delete(side+8); else checkPluck(side+8,p8);
+      // plucks use the raw fingertip: the smoothed one lags behind a fast flick and can miss the string
+      if(h.pinch) pluckers.delete(side+8); else checkPluck(side+8,f.lm[8]);
     }
     // both hands pinching empty air: a new string stretches between them, each hand holds one end
     const L_=hands.L, R_=hands.R;
@@ -630,11 +646,11 @@ function loop(now){
     }
   }
   active=Math.min(active,wires.length-1);
-  const ga=geom(wires[active]); A=ga.a; B=ga.b;
+  if(wires.length){ const ga=geom(wires[active]); A=ga.a; B=ga.b; } else { A={x:-1e4,y:-1e4}; B={x:-1e4+10,y:-1e4}; }
   // every string tunes itself from its own length: shorter is higher
   wires.forEach(w=>{ w.midi=rootMidi(geom(w).L)+wireIv(w); w.phase+=(6+(w.midi-40)*.35)*.1; w.amp*=.968; });
   const fs=wires.map(w=>mtof(w.midi)*SOUNDS[w.sound].mul); while(fs.length<6) fs.push(fs[0]);
-  if(wires.length<5){ const am=SOUNDS[wires[active].sound].mul; fs[4]=mtof(wires[active].midi+7)*am; fs[5]=mtof(wires[active].midi+12)*am; }
+  if(wires.length&&wires.length<5){ const am=SOUNDS[wires[active].sound].mul; fs[4]=mtof(wires[active].midi+7)*am; fs[5]=mtof(wires[active].midi+12)*am; }
   if(node) node.port.postMessage({t:'f',f:fs});
 
   // ---- GPU pass ----
@@ -645,7 +661,7 @@ function loop(now){
   const rip=new Float32Array(32).fill(-1);
   ripples.forEach((r,k)=>{ rip.set([r.x,r.y,(now-r.t)/1000,r.hue/360],k*4); });
   gl.uniform2f(Uf('uRes'),glc.width,glc.height); gl.uniform1f(Uf('uPx'),glPx);
-  gl.uniform1f(Uf('uT'),t); gl.uniform1f(Uf('uU'),U); gl.uniform1f(Uf('uN'),wires.length); gl.uniform1f(Uf('uStyle'),wires[active].sound);
+  gl.uniform1f(Uf('uT'),t); gl.uniform1f(Uf('uU'),U); gl.uniform1f(Uf('uN'),wires.length); gl.uniform1f(Uf('uStyle'),wires[active]?wires[active].sound:soundIdx);
   gl.uniform1f(Uf('uEnergy'),energy); gl.uniform1f(Uf('uLevel'),level); gl.uniform1f(Uf('uFieldHue'),fieldHueS/360);
   gl.uniform1f(Uf('uHasVid'),hasVid?1:0); gl.uniform1f(Uf('uFlash'),styleFlash);
   gl.uniform2f(Uf('uA'),A.x,A.y); gl.uniform2f(Uf('uB'),B.x,B.y);
@@ -660,7 +676,7 @@ function loop(now){
   // ---- overlay ----
   ctx.clearRect(0,0,W,H);
   ctx.save(); ctx.globalCompositeOperation='lighter';
-  // a fingertip near the string draws sparks to it before you play
+  // a fingertip near a string draws sparks to it before you play
   for(const side of ['L','R']){ const h=hands[side]; if(!h.lm||h.grab||now-h.lastSeen>HOLD) continue;
     for(const k of [8]){ if(h.pinch) continue; const p=h.tips[k].v; if(!p) continue;
       let q=null, dd=U*8;
@@ -681,6 +697,13 @@ function loop(now){
     ctx.lineTo(g.x,g.y+r); ctx.lineTo(g.x-r*.16,g.y+r*.16); ctx.lineTo(g.x-r,g.y); ctx.lineTo(g.x-r*.16,g.y-r*.16); ctx.closePath(); ctx.fill();
     ctx.fillStyle=`rgba(255,255,255,${a})`; ctx.beginPath(); ctx.arc(g.x,g.y,r*.14,0,7); ctx.fill(); }
   if(glints.length>500) glints.splice(0,glints.length-500);
+  for(let i=flying.length-1;i>=0;i--){ const f=flying[i]; f.life-=.025; if(f.life<=0){ flying.splice(i,1); continue; }
+    for(const q of [f.a,f.b]){ q.x+=f.vx; q.y+=f.vy; }
+    const mx=(f.a.x+f.b.x)/2, my=(f.a.y+f.b.y)/2, c=Math.cos(f.spin), s_=Math.sin(f.spin);
+    for(const q of [f.a,f.b]){ const dx=q.x-mx, dy=q.y-my; q.x=mx+dx*c-dy*s_; q.y=my+dx*s_+dy*c; }
+    f.vx*=.97; f.vy*=.97;
+    ctx.strokeStyle=hsl(f.hue,40,85,f.life*.9); ctx.lineWidth=Math.max(1,U*.25*f.life); ctx.lineCap='round';
+    ctx.beginPath(); ctx.moveTo(f.a.x,f.a.y); ctx.lineTo(f.b.x,f.b.y); ctx.stroke(); }
   for(let i=sparks.length-1;i>=0;i--){ const p=sparks[i]; p.x+=p.vx; p.y+=p.vy; p.vx*=.95; p.vy*=.95; p.life-=.022;
     if(p.life<=0){ sparks.splice(i,1); continue; } ctx.fillStyle=hsl(p.hue,45,85,p.life); const s=U*.35; ctx.fillRect(p.x-s/2,p.y-s/2,s,s); }
   if(sparks.length>1200) sparks.splice(0,sparks.length-1200);
@@ -689,7 +712,8 @@ function loop(now){
 
   const cx=(A.x+B.x)/2, cy=(A.y+B.y)/2, ang=Math.atan2(B.y-A.y,B.x-A.x), nx=Math.sin(ang), ny=-Math.cos(ang);
   ctx.font=`${Math.round(U*1.8)}px ui-monospace, Menlo, monospace`; ctx.textAlign='center'; ctx.textBaseline='middle';
-  ctx.fillStyle='rgba(255,255,255,.8)'; ctx.fillText(noteName(wires[active].midi), cx+nx*U*7, cy+ny*U*7);
+  if(wires[active]){ ctx.fillStyle='rgba(255,255,255,.8)'; ctx.fillText(noteName(wires[active].midi), cx+nx*U*7, cy+ny*U*7); }
+  else { ctx.fillStyle='rgba(255,255,255,.6)'; ctx.fillText('pinch with both hands and pull apart to draw a string', W/2, H*.42); }
   ctx.font=`${Math.round(U*1.4)}px ui-monospace, Menlo, monospace`; ctx.fillStyle='rgba(255,255,255,.45)';
   wires.forEach((w,i)=>{ if(i===active) return; const g=geom(w); if(g.L<U*6) return; const mx=(g.a.x+g.b.x)/2, my=(g.a.y+g.b.y)/2;
     ctx.fillText(noteName(w.midi), mx-g.nx*U*4, my-g.ny*U*4); });
