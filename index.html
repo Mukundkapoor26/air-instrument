@@ -242,8 +242,8 @@ function checkPluck(id,p){
   const now=performance.now(), prev=pluckers.get(id); pluckers.set(id,{x:p.x,y:p.y,t:now});
   if(!prev||now-prev.t>220) return; // the finger just appeared: nothing to compare with yet
   const speed=Math.hypot(p.x-prev.x,p.y-prev.y); if(speed<U*.1) return;
+  // a string you're holding by one end can still be played by your other hand, like fretting and plucking
   wires.forEach((w,i)=>{
-    if(isHeld(i)) return;
     const g=geom(w), ux=(g.b.x-g.a.x)/g.L, uy=(g.b.y-g.a.y)/g.L;
     const side=q=>(g.b.x-g.a.x)*(q.y-g.a.y)-(g.b.y-g.a.y)*(q.x-g.a.x);
     const s0=side(prev), s1=side(p); if(s0===0||Math.sign(s0)===Math.sign(s1)) return;
@@ -549,10 +549,11 @@ const toWorld=e=>({ x:e.clientX, y:e.clientY });
 cv.addEventListener('pointerdown',e=>{ const p=toWorld(e); let g=tryGrab(p);
   if(g&&g.key==='both'&&!e.shiftKey) g=null;
   if(!g&&e.shiftKey) g=createWire(p);
-  if(g){ mouseGrab=g; try{ cv.setPointerCapture(e.pointerId); }catch(_){} return; }
+  if(g){ g.pid=e.pointerId; mouseGrab=g; try{ cv.setPointerCapture(e.pointerId); }catch(_){} return; }
   pluckers.set('ptr'+e.pointerId,p); });
-cv.addEventListener('pointermove',e=>{ const p=toWorld(e); if(mouseGrab){ moveGrab(mouseGrab,p); return; } checkPluck('ptr'+e.pointerId,p); });
-addEventListener('pointerup',e=>{ releaseGrab(mouseGrab); mouseGrab=null; pluckers.delete('ptr'+e.pointerId); });
+// only the pointer that grabbed a string moves it; any other finger or pointer still plays
+cv.addEventListener('pointermove',e=>{ const p=toWorld(e); if(mouseGrab&&mouseGrab.pid===e.pointerId){ moveGrab(mouseGrab,p); return; } checkPluck('ptr'+e.pointerId,p); });
+addEventListener('pointerup',e=>{ if(mouseGrab&&mouseGrab.pid===e.pointerId){ releaseGrab(mouseGrab); mouseGrab=null; } pluckers.delete('ptr'+e.pointerId); });
 
 // ---------- UI ----------
 document.getElementById('sounds').innerHTML=SOUNDS.map((s,i)=>`<button class="chip" data-i="${i}">${s.name}</button>`).join('');
