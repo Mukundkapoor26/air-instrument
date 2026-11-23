@@ -9,7 +9,7 @@
   * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
   html, body { margin:0; height:100%; background:#000; color:var(--w); overflow:hidden; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size:13px; }
   video { display:none; }
-  #gl, #cv { position:fixed; inset:0; width:100vw; height:100vh; }
+  #gl, #cv { position:fixed; left:0; top:0; }   /* sized in JS to exactly the visible area, so nothing is stretched on phones */
   #cv { touch-action:none; }
   .top { position:fixed; top:max(16px, env(safe-area-inset-top)); left:var(--pad); right:var(--pad); display:flex; justify-content:space-between; align-items:center; pointer-events:none; text-shadow:0 1px 8px rgba(0,0,0,.6); }
   .brand span, #note { color:var(--mid); }
@@ -526,6 +526,7 @@ function resize(){
   W=innerWidth; H=innerHeight; U=Math.min(W,H)*.01;
   cv.width=Math.round(W*dpr); cv.height=Math.round(H*dpr); ctx.setTransform(dpr,0,0,dpr,0,0);
   glc.width=Math.round(W*glPx); glc.height=Math.round(H*glPx); gl.viewport(0,0,glc.width,glc.height);
+  for(const c of [cv,glc]){ c.style.width=W+'px'; c.style.height=H+'px'; }
   const vw=video.videoWidth||1280, vh=video.videoHeight||720;
   vS=Math.max(W/vw,H/vh); vX=(W-vw*vS)/2; vY=(H-vh*vS)/2;
 }
