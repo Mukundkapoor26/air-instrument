@@ -60,16 +60,17 @@
     <div class="seg" id="strings"><button data-n="1" class="on">1</button><button data-n="3">3</button><button data-n="6">6</button></div>
     <span style="color:var(--mid)">strings</span>
     <span class="spacer"></span>
+    <button class="toggle on" id="tTension" title="on: stretch = higher, like a tuning peg · off: shorter = higher, like a fret">tension</button>
     <button class="toggle on" id="tSnap">snap</button>
     <button class="toggle" id="tMinor">minor</button>
   </div>
-  <div class="hint">swipe a fingertip through the string to play · pinch an end to move it, let go and it stays · pinch the middle to move the whole string</div>
+  <div class="hint">swipe a fingertip through a string to play · pinch an end and stretch to tune it · pinch empty air and pull to draw a new string · mouse: shift-drag to draw · c clears</div>
 </div>
 
 <div id="start">
 <pre>·  ─  ─  ∿  ∿  ∿  ∿  ∿  ─  ─  ·</pre>
   <h1>air<span>/</span>instrument</h1>
-  <p>A string hangs in the air in front of you. Swipe a finger through it to play. Pinch an end to stretch it and change the note.</p>
+  <p>A string hangs in the air in front of you. Swipe a finger through it to play. Pinch an end and stretch it to tune it, or pinch empty air and pull to draw a new string.</p>
   <div class="btns"><button id="go">start camera</button><button id="mouse">play with mouse</button></div>
   <p id="status">loading…</p>
 </div>
@@ -91,7 +92,7 @@ const SOUNDS=[
   { name:'glass', mode:0, bright:.98, damp:.9993, drive:0,  buzz:0, lp:11000, wet:.6, mul:4 },
   { name:'synth', mode:1, env:.99985, drive:1, buzz:0, lp:5000, wet:.35, mul:1 },
 ];
-let soundIdx=0, nStrings=1, snap=true, minor=false;
+let soundIdx=0, nStrings=1, snap=true, minor=false, tension=true;
 
 // ---------- audio engine ----------
 const WORKLET=`
@@ -178,7 +179,9 @@ function snapMidi(m){ const sc=minor?PENTA_MIN:PENTA_MAJ; const base=Math.floor(
   for(let o=-12;o<=12;o+=12) for(const s of sc){ const c=base+o+s; if(Math.abs(c-m)<bd){bd=Math.abs(c-m);best=c;} } return best; }
 let W=0,H=0,U=1; // buffer size, and 1% of the short side
 function rootMidi(len){ const ref=.35*Math.max(W,H*1.2); const L=Math.max(.25*ref,Math.min(3*ref,len));
-  const f=220*(ref/L); const m=69+12*Math.log2(f/440); return snap?snapMidi(Math.round(m)):m; }
+  // tension (default): stretching tightens the string like a tuning peg, so longer = higher.
+  // off: like fretting a guitar, a shorter string = higher.
+  const f=220*(tension?L/ref:ref/L); const m=69+12*Math.log2(f/440); return snap?snapMidi(Math.round(m)):m; }
 const mtof=m=>440*Math.pow(2,(m-69)/12);
 const noteName=m=>{ const r=Math.round(m); return NAMES[((r%12)+12)%12]+(Math.floor(r/12)-1); };
 // every note owns a colour: the 12 pitch classes walk the colour wheel, octaves nudge it
@@ -197,60 +200,95 @@ const fp=(p,x,y,t)=>(p.v={x:p.x.filter(x,t),y:p.y.filter(y,t)});
 const mkHand=()=>({ pinchP:mkP(), tips:{8:mkP(),12:mkP(),16:mkP()}, trails:{8:[],12:[],16:[]}, lm:null, pinch:false, grab:null, lastSeen:-1e9, center:null });
 const hands={L:mkHand(),R:mkHand()}; const HOLD=250;
 
-// ---------- the string: fixed in the air, in screen fractions ----------
-const ends={ a:{x:.22,y:.5}, b:{x:.78,y:.5} };
+// ---------- strings: each one hangs in the air on its own (positions in screen fractions) ----------
+// pinch an end to move it, pinch the middle to move a whole string, pinch empty air and stretch to draw a new one
+let wires=[], active=0;
 let A={x:0,y:0}, B={x:0,y:0}, freeMode=false, mouseGrab=null;
-let strs=[], sparks=[], ripples=[], notePop=null, fieldHue=270, fieldHueS=270, energy=0, styleFlash=0;
+let sparks=[], glints=[], ripples=[], notePop=null, fieldHue=270, fieldHueS=270, energy=0, styleFlash=0;
 const pluckers=new Map();
 const STYLE_NAMES=['silk','spectrum','silk flame','mandala','iridescent','prism','pastel smear'];
-const gapU=()=>nStrings===3?7:nStrings===6?5.5:0; // room between strings, so one can be played alone
-
-function stringGeom(i){
-  const dx=B.x-A.x, dy=B.y-A.y, L=Math.hypot(dx,dy)||1, nx=-dy/L, ny=dx/L;
-  const off=(i-(nStrings-1)/2)*U*gapU();
-  return { a:{x:A.x+nx*off,y:A.y+ny*off}, b:{x:B.x+nx*off,y:B.y+ny*off}, nx, ny, L };
+const MAXW=6; // one audio voice per string
+const mkWire=(a,b,preset=0,ci=0)=>({a,b,preset,ci,amp:0,pos:.5,lastPluck:0,midi:57,phase:Math.random()*6});
+function geom(w){ const a={x:w.a.x*W,y:w.a.y*H}, b={x:w.b.x*W,y:w.b.y*H}; const dx=b.x-a.x, dy=b.y-a.y, L=Math.hypot(dx,dy)||1; return {a,b,nx:-dy/L,ny:dx/L,L}; }
+const chordFor=n=>{ const c=CHORDS[n].slice(); if(minor&&n===6) c[3]=15; return c; };
+const wireIv=w=>w.preset?chordFor(w.preset)[w.ci]:0;
+// presets: 1 string, or 3 / 6 parallel strings tuned as a chord and spaced so one can be played alone
+function setStrings(n){
+  nStrings=n;
+  const base=wires[active]||mkWire({x:.22,y:.5},{x:.78,y:.5});
+  const g=geom(base), gap=U*(n===3?7:n===6?5.5:0);
+  wires=CHORDS[n].map((_,i)=>{ const off=(i-(n-1)/2)*gap, ox=g.nx*off/W, oy=g.ny*off/H;
+    return mkWire({x:base.a.x+ox,y:base.a.y+oy},{x:base.b.x+ox,y:base.b.y+oy},n>1?n:0,i); });
+  active=0; hands.L.grab=hands.R.grab=mouseGrab=null;
+  document.querySelectorAll('#strings button').forEach(b=>b.classList.toggle('on',+b.dataset.n===n));
 }
 function pluck(i,pos,vel){
-  const s=strs[i], now=performance.now(); if(now-s.lastPluck<80) return; s.lastPluck=now;
-  s.amp=Math.min(1,.35+vel); s.pos=pos;
+  const w=wires[i]; if(!w) return; const now=performance.now(); if(now-w.lastPluck<80) return; w.lastPluck=now;
+  w.amp=Math.min(1,.35+vel); w.pos=pos; active=i;
   const v=Math.min(1,.3+vel*.9);
   if(node){ node.port.postMessage({t:'pluck',i,pos,vel:v});
-    if(SOUNDS[soundIdx].power&&nStrings===1){ node.port.postMessage({t:'pluck',i:4,pos,vel:v*.8}); node.port.postMessage({t:'pluck',i:5,pos,vel:v*.6}); } }
-  const g=stringGeom(i), p={x:g.a.x+(g.b.x-g.a.x)*pos, y:g.a.y+(g.b.y-g.a.y)*pos}, hue=noteHue(s.midi);
+    if(SOUNDS[soundIdx].power&&wires.length===1){ node.port.postMessage({t:'pluck',i:4,pos,vel:v*.8}); node.port.postMessage({t:'pluck',i:5,pos,vel:v*.6}); } }
+  const g=geom(w), p={x:g.a.x+(g.b.x-g.a.x)*pos, y:g.a.y+(g.b.y-g.a.y)*pos}, hue=noteHue(w.midi);
   for(let k=0;k<22;k++){ const a=Math.random()*6.28, sp=U*(.15+Math.random()*1.1)*(.5+vel); sparks.push({x:p.x,y:p.y,vx:Math.cos(a)*sp,vy:Math.sin(a)*sp,life:1,hue:hue+Math.random()*70-35}); }
+  // high notes throw glitter: the higher the pitch, the more stars
+  const hi=Math.max(0,Math.min(1,(w.midi-62)/22));
+  for(let k=0;k<Math.round(hi*40);k++){ const u=Math.random(), a=Math.random()*6.28, sp=U*(.1+Math.random()*.9)*(.6+hi);
+    glints.push({x:g.a.x+(g.b.x-g.a.x)*u+(Math.random()-.5)*U*2, y:g.a.y+(g.b.y-g.a.y)*u+(Math.random()-.5)*U*2, vx:Math.cos(a)*sp*.5, vy:Math.sin(a)*sp*.5-U*.08, life:1, size:U*(.5+Math.random()*1.1*(.5+hi)), tw:Math.random()*6.28, hue}); }
   ripples.push({x:p.x,y:p.y,t:now,hue}); if(ripples.length>8) ripples.shift();
   energy=Math.min(2.4,energy+.7+vel); fieldHue=hue;
-  notePop={ text:noteName(s.midi), t:now, hue };
-  document.getElementById('note').textContent=noteName(s.midi)+' · '+SOUNDS[soundIdx].name;
+  notePop={ text:noteName(w.midi), t:now, hue };
+  document.getElementById('note').textContent=noteName(w.midi)+' · '+SOUNDS[soundIdx].name;
 }
 function checkPluck(id,p){
   const prev=pluckers.get(id); pluckers.set(id,p); if(!prev) return;
   const speed=Math.hypot(p.x-prev.x,p.y-prev.y); if(speed<U*.15||speed>U*40) return;
-  for(let i=0;i<nStrings;i++){
-    const g=stringGeom(i), ux=(g.b.x-g.a.x)/g.L, uy=(g.b.y-g.a.y)/g.L;
+  wires.forEach((w,i)=>{
+    if(isHeld(i)) return;
+    const g=geom(w), ux=(g.b.x-g.a.x)/g.L, uy=(g.b.y-g.a.y)/g.L;
     const side=q=>(g.b.x-g.a.x)*(q.y-g.a.y)-(g.b.y-g.a.y)*(q.x-g.a.x);
-    const s0=side(prev), s1=side(p); if(s0===0||Math.sign(s0)===Math.sign(s1)) continue;
+    const s0=side(prev), s1=side(p); if(s0===0||Math.sign(s0)===Math.sign(s1)) return;
     const f=s0/(s0-s1), cx=prev.x+(p.x-prev.x)*f, cy=prev.y+(p.y-prev.y)*f;
     const t=((cx-g.a.x)*ux+(cy-g.a.y)*uy)/g.L;
     if(t>.02&&t<.98) pluck(i,t,Math.min(1,speed/(U*4)));
-  }
+  });
 }
-// grab: pinch near an end moves that end; pinch on the string body moves the whole string
+const allGrabs=()=>[hands.L.grab,hands.R.grab,mouseGrab].filter(Boolean);
+const isHeld=i=>allGrabs().some(g=>g.w===i);
 function tryGrab(p){
-  const pa={x:ends.a.x*W,y:ends.a.y*H}, pb={x:ends.b.x*W,y:ends.b.y*H};
-  const taken=new Set([hands.L.grab,hands.R.grab,mouseGrab].filter(Boolean).map(g=>g.key));
-  const da=Math.hypot(p.x-pa.x,p.y-pa.y), db=Math.hypot(p.x-pb.x,p.y-pb.y), R=U*9;
-  if(da<R&&da<=db&&!taken.has('a')) return {key:'a'};
-  if(db<R&&!taken.has('b')) return {key:'b'};
-  const dx=pb.x-pa.x, dy=pb.y-pa.y, L2=dx*dx+dy*dy||1, t=Math.max(0,Math.min(1,((p.x-pa.x)*dx+(p.y-pa.y)*dy)/L2));
-  const d=Math.hypot(pa.x+dx*t-p.x,pa.y+dy*t-p.y);
-  if(d<U*4&&taken.size===0) return {key:'both', oa:{x:pa.x-p.x,y:pa.y-p.y}, ob:{x:pb.x-p.x,y:pb.y-p.y}};
+  const taken=new Set(allGrabs().map(g=>g.w+':'+g.key));
+  let best=null, bd=U*9;
+  wires.forEach((w,i)=>{ const g=geom(w);
+    for(const key of ['a','b']){ const q=g[key], d=Math.hypot(p.x-q.x,p.y-q.y);
+      if(d<bd&&!taken.has(i+':'+key)&&!taken.has(i+':both')){ bd=d; best={w:i,key}; } } });
+  if(best) return best;
+  for(let i=0;i<wires.length;i++){ const g=geom(wires[i]); if(isHeld(i)) continue;
+    const dx=g.b.x-g.a.x, dy=g.b.y-g.a.y, L2=dx*dx+dy*dy||1, t=Math.max(0,Math.min(1,((p.x-g.a.x)*dx+(p.y-g.a.y)*dy)/L2));
+    if(Math.hypot(g.a.x+dx*t-p.x,g.a.y+dy*t-p.y)<U*3.5) return {w:i,key:'both',oa:{x:g.a.x-p.x,y:g.a.y-p.y},ob:{x:g.b.x-p.x,y:g.b.y-p.y}}; }
   return null;
 }
-const clamp01=(v,lo=.03,hi=.97)=>Math.min(hi,Math.max(lo,v));
+// pinching empty air starts a new string at that spot; stretching pulls out its other end
+function createWire(p){
+  if(wires.length>=MAXW){ document.getElementById('note').textContent='6 strings max · press 1 to reset'; return null; }
+  const at={x:clamp01(p.x/W),y:clamp01(p.y/H)};
+  wires.push(mkWire({...at},{...at})); active=wires.length-1;
+  return {w:wires.length-1,key:'b',creating:true};
+}
+function removeWire(i){
+  wires.splice(i,1);
+  for(const g of allGrabs()) if(g.w>i) g.w--;
+  active=Math.min(active,wires.length-1);
+  if(!wires.length) setStrings(1);
+}
+function releaseGrab(g){
+  if(!g) return;
+  const w=wires[g.w];
+  if(g.creating&&w&&geom(w).L<U*6) removeWire(g.w); // a tiny pinch, not a string
+}
+const clamp01=(v,lo=.02,hi=.98)=>Math.min(hi,Math.max(lo,v));
 function moveGrab(g,p){
-  if(g.key==='both'){ ends.a={x:clamp01((p.x+g.oa.x)/W),y:clamp01((p.y+g.oa.y)/H)}; ends.b={x:clamp01((p.x+g.ob.x)/W),y:clamp01((p.y+g.ob.y)/H)}; }
-  else ends[g.key]={x:clamp01(p.x/W),y:clamp01(p.y/H)};
+  const w=wires[g.w]; if(!w) return;
+  if(g.key==='both'){ w.a={x:clamp01((p.x+g.oa.x)/W),y:clamp01((p.y+g.oa.y)/H)}; w.b={x:clamp01((p.x+g.ob.x)/W),y:clamp01((p.y+g.ob.y)/H)}; }
+  else w[g.key]={x:clamp01(p.x/W),y:clamp01(p.y/H)};
 }
 
 // ---------- GPU visuals: every wave, string and end is drawn by this shader ----------
@@ -259,10 +297,10 @@ const gl=glc.getContext('webgl',{antialias:false,premultipliedAlpha:false});
 const FS=`
 precision highp float;
 uniform vec2 uRes; uniform float uPx, uT, uU, uN, uStyle, uEnergy, uLevel, uFieldHue, uHasVid, uFlash;
-uniform vec2 uA, uB, uGrab;
+uniform vec2 uA, uB; uniform vec2 uSA[6], uSB[6]; uniform float uHeld[6];
 uniform float uAmp[6], uPhase[6], uHue[6], uPos[6];
 uniform vec4 uRip[8];
-uniform sampler2D uVid, uFFT; uniform vec4 uVidR; uniform float uGap;
+uniform sampler2D uVid, uFFT; uniform vec4 uVidR;
 
 vec3 hcol(float h, float s){ vec3 c=clamp(abs(mod(h*6.+vec3(0.,4.,2.),6.)-3.)-1.,0.,1.); return mix(vec3(1.),c,s); }
 float hash(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453); }
@@ -361,53 +399,55 @@ void main(){
     float body=exp(-abs(v)/(2.6+amp*.5+n1*3.));
     col+=c1*body*(1.35+E*.35)*ext; }
 
-  // keep every effect tight around the strings: nothing spills across the screen
-  float spread=(uN-1.)*uGap*.5;
+  // keep the style's effect tight around the string you last played: nothing spills across the screen
   float showpiece=(abs(uStyle-2.)<.5||abs(uStyle-4.)<.5||uStyle>5.5)?1.:0.;
-  float bandW=(uStyle>.5&&uStyle<1.5?9.:2.6+min(amp,10.)*.3+showpiece*2.)+spread*.8;
+  float bandW=uStyle>.5&&uStyle<1.5?9.:2.6+min(amp,10.)*.3+showpiece*2.;
   float along=smoothstep(-.015,.05,u)*smoothstep(1.015,.95,u);
-  col*=exp(-pow(max(0.,abs(v)-spread*.6)/bandW,2.))*along*.85;
+  col*=exp(-pow(abs(v)/bandW,2.))*along*.85;
 
-  // metal strings: a thin polished wire with a specular line and rainbow-split edges,
-  // wrapped in chrome filaments that come alive when the string rings
-  float sumAmp=0.;
+  // every string: a thin polished wire with a specular line and rainbow-split edges,
+  // wrapped in chrome filaments that come alive when it rings
   for(int i=0;i<6;i++){ if(float(i)>=uN) break;
-    float off=(float(i)-(uN-1.)*.5)*uGap;
-    float uc=clamp(u,0.,1.), pos=clamp(uPos[i],.05,.95);
+    vec2 sa=uSA[i], sd=uSB[i]-uSA[i]; float sL=max(length(sd),1.); vec2 sdir=sd/sL, sn=vec2(-sdir.y,sdir.x);
+    vec2 sr=p-sa; float su=dot(sr,sdir)/sL, sxu=dot(sr,sdir)/U, sv0=(dot(sr,sn)+ripple*U*4.)/U;
+    if(abs(sv0)>14.||su<-.05||su>1.05) continue;
+    float sIn=smoothstep(0.,.03,su)*smoothstep(1.,.97,su);
+    float uc=clamp(su,0.,1.), pos=clamp(uPos[i],.05,.95);
     float shape=uc<pos?uc/pos:(1.-uc)/(1.-pos);
-    float am=uAmp[i]; sumAmp+=am;
-    float a=am*5.;
+    float am=uAmp[i], a=am*5.;
     float dsp=a*sin(uPhase[i])*(.6*shape+.4*sin(3.14159*uc))+a*.25*sin(6.2832*uc)*sin(uPhase[i]*2.1)+sin(uc*3.14159)*.25*sin(t*2.+uc*6.+float(i));
-    float sv=v-off-dsp;
-    // chromatic dispersion: red, green and blue sit a hair apart, more so while it vibrates
+    float sv=sv0-dsp;
     float sp=.09+am*.35;
     vec3 dRGB=abs(vec3(sv-sp,sv,sv+sp));
     vec3 wire=exp(-dRGB*dRGB*16.);
     vec3 halo=.05/(dRGB*dRGB*.7+.05)*(.18+am*.8);
-    float spec=exp(-pow((sv+.06)*22.,2.))*(.7+.3*sin(xu*.4-t*3.));        // the polished highlight
+    float spec=exp(-pow((sv+.06)*22.,2.))*(.7+.3*sin(sxu*.4-t*3.));
     vec3 tint=hcol(uHue[i]+uc*.04,.35);
-    col+=(wire*mix(vec3(.85),tint,.4)*1.2+halo*tint+vec3(spec))*inside;
-    // chrome filaments: thin noisy strands hugging the wire, iridescent like oil on metal
+    col+=(wire*mix(vec3(.85),tint,.4)*1.2+halo*tint+vec3(spec))*sIn;
     for(int k=0;k<3;k++){ float fk=float(k);
-      float fy=(fbm(vec2(xu*.16+fk*4.1+float(i)*7.,t*(.9+am*2.)+fk*2.))-.5)*(1.2+am*7.)*sin(3.14159*uc);
+      float fy=(fbm(vec2(sxu*.16+fk*4.1+float(i)*7.,t*(.9+am*2.)+fk*2.))-.5)*(1.2+am*7.)*sin(3.14159*uc);
       float fl=sv-fy;
       vec3 fd=abs(vec3(fl-.12,fl,fl+.12));
       vec3 strand=.006/(fd*fd+.006);
       vec3 iri=.6+.4*cos(6.2832*(uc*1.3+fk*.27+t*.07+vec3(0.,.33,.67)));
-      col+=strand*iri*(.05+am*.9)*inside;
+      col+=strand*iri*(.05+am*.9)*sIn;
     }
   }
   col*=1.+lift*.9;
 
-  // the two ends: simple bright dots with a soft halo and a short flare along the string
-  for(int e=0;e<2;e++){
-    vec2 P=e==0?uA:uB; float gr=e==0?uGrab.x:uGrab.y;
-    vec2 q=(p-P)/U; float r=length(q); vec2 qa=vec2(dot(q,dir),dot(q,n));
-    float sc=1.+gr*.5;
-    float dot=smoothstep(.55*sc,.35*sc,r);
-    float halo=.12/(r*r/sc+.12)*.6;
-    float streak=exp(-abs(qa.y)*3.)*exp(-abs(qa.x)/(5.*sc))*.35;
-    col+=vec3(1.)*dot+hcol(uHue[0],.25)*(halo+streak);
+  // each string's two ends: simple bright dots with a soft halo and a short flare along the string
+  for(int i=0;i<6;i++){ if(float(i)>=uN) break;
+    vec2 sd=uSB[i]-uSA[i]; vec2 sdir=sd/max(length(sd),1.), sn=vec2(-sdir.y,sdir.x);
+    for(int e=0;e<2;e++){
+      vec2 P=e==0?uSA[i]:uSB[i];
+      vec2 q=(p-P)/U; float r=length(q); if(r>16.) continue;
+      vec2 qa=vec2(dot(q,sdir),dot(q,sn));
+      float sc=1.+uHeld[i]*.5;
+      float dt=smoothstep(.55*sc,.35*sc,r);
+      float halo=.12/(r*r/sc+.12)*.6;
+      float streak=exp(-abs(qa.y)*3.)*exp(-abs(qa.x)/(5.*sc))*.35;
+      col+=vec3(1.)*dt+hcol(uHue[i],.25)*(halo+streak);
+    }
   }
 
   col=1.-exp(-col*1.3);
@@ -453,7 +493,7 @@ const ready=(async()=>{
   statusEl.textContent='ready';
 })().catch(()=>{ statusEl.textContent='hand tracker failed to load, mouse mode still works'; });
 
-function begin(){ document.getElementById('start').remove(); resize(); setStrings(nStrings); requestAnimationFrame(loop); }
+function begin(){ document.getElementById('start').remove(); resize(); setStrings(1); requestAnimationFrame(loop); }
 document.getElementById('go').onclick=async()=>{
   await initAudio(); ac.resume();
   try{ const st=await navigator.mediaDevices.getUserMedia({ video:{ width:{ideal:1280}, height:{ideal:720}, facingMode:'user' }, audio:false });
@@ -489,11 +529,14 @@ function assign(found){
 
 // ---------- pointer ----------
 const toWorld=e=>({ x:e.clientX, y:e.clientY });
-cv.addEventListener('pointerdown',e=>{ const p=toWorld(e); const g=tryGrab(p);
-  if(g&&(g.key!=='both'||e.shiftKey)){ mouseGrab=g; cv.setPointerCapture(e.pointerId); return; }
+// mouse: drag an end to move it, shift-drag the middle to move a string, shift-drag empty space to draw a new one
+cv.addEventListener('pointerdown',e=>{ const p=toWorld(e); let g=tryGrab(p);
+  if(g&&g.key==='both'&&!e.shiftKey) g=null;
+  if(!g&&e.shiftKey) g=createWire(p);
+  if(g){ mouseGrab=g; try{ cv.setPointerCapture(e.pointerId); }catch(_){} return; }
   pluckers.set('ptr'+e.pointerId,p); });
 cv.addEventListener('pointermove',e=>{ const p=toWorld(e); if(mouseGrab){ moveGrab(mouseGrab,p); return; } checkPluck('ptr'+e.pointerId,p); });
-addEventListener('pointerup',e=>{ mouseGrab=null; pluckers.delete('ptr'+e.pointerId); });
+addEventListener('pointerup',e=>{ releaseGrab(mouseGrab); mouseGrab=null; pluckers.delete('ptr'+e.pointerId); });
 
 // ---------- UI ----------
 document.getElementById('sounds').innerHTML=SOUNDS.map((s,i)=>`<button class="chip" data-i="${i}">${s.name}</button>`).join('');
@@ -502,9 +545,8 @@ document.querySelectorAll('#sounds button').forEach(b=>b.onclick=()=>pickSound(+
 const shiftSound=d=>{ pickSound((soundIdx+d+SOUNDS.length)%SOUNDS.length); document.querySelectorAll('#sounds button')[soundIdx].scrollIntoView({inline:'center',block:'nearest'}); };
 document.getElementById('prev').onclick=()=>shiftSound(-1);
 document.getElementById('next').onclick=()=>shiftSound(1);
-function setStrings(n){ nStrings=n; strs=Array.from({length:n},()=>({amp:0,pos:.5,lastPluck:0,midi:57,phase:Math.random()*6}));
-  document.querySelectorAll('#strings button').forEach(b=>b.classList.toggle('on',+b.dataset.n===n)); }
 document.querySelectorAll('#strings button').forEach(b=>b.onclick=()=>setStrings(+b.dataset.n));
+document.getElementById('tTension').onclick=e=>{ tension=!tension; e.currentTarget.classList.toggle('on',tension); document.getElementById('note').textContent=tension?'tension · stretch to go higher':'length · shorter is higher'; };
 document.getElementById('tSnap').onclick=e=>{ snap=!snap; e.currentTarget.classList.toggle('on',snap); };
 document.getElementById('tMinor').onclick=e=>{ minor=!minor; e.currentTarget.classList.toggle('on',minor); };
 applySound();
@@ -512,7 +554,9 @@ addEventListener('keydown',e=>{ const k=e.key.toLowerCase();
   if(e.key==='ArrowRight') shiftSound(1); if(e.key==='ArrowLeft') shiftSound(-1);
   if(['1','3','6'].includes(k)) setStrings(+k);
   if(k==='h') document.body.classList.toggle('clean');
-  if(e.key===' '){ e.preventDefault(); for(let i=0;i<nStrings;i++) setTimeout(()=>pluck(i,.3,.6),i*35); }
+  if(k==='t') document.getElementById('tTension').click();
+  if(k==='c') setStrings(1);
+  if(e.key===' '){ e.preventDefault(); wires.forEach((_,i)=>setTimeout(()=>pluck(i,.3,.6),i*35)); }
 });
 
 // ---------- overlay: neon hands, sparks, note names ----------
@@ -560,13 +604,13 @@ function loop(now){
       return { lm:P, size, cx:(P[0].x+P[9].x)/2, cy:(P[0].y+P[9].y)/2 }; });
     const as=assign(found);
     for(const side of ['L','R']){ const h=hands[side], f=as[side];
-      if(!f){ if(now-h.lastSeen>HOLD){ h.grab=null; h.pinch=false; h.lm=null; for(const k in h.trails) h.trails[k]=[]; } continue; }
+      if(!f){ if(now-h.lastSeen>HOLD){ releaseGrab(h.grab); h.grab=null; h.pinch=false; h.lm=null; for(const k in h.trails) h.trails[k]=[]; } continue; }
       h.lastSeen=now; h.center={x:f.cx,y:f.cy};
       h.lm=h.lm?f.lm.map((p,i)=>({x:h.lm[i].x+(p.x-h.lm[i].x)*.6,y:h.lm[i].y+(p.y-h.lm[i].y)*.6})):f.lm;
       const th=f.lm[4], ix=f.lm[8], d=Math.hypot(th.x-ix.x,th.y-ix.y)/f.size;
       const pp=fp(h.pinchP,(th.x+ix.x)/2,(th.y+ix.y)/2,now);
-      if(!h.pinch&&d<.28){ h.pinch=true; h.grab=tryGrab(pp); }
-      else if(h.pinch&&d>.42){ h.pinch=false; h.grab=null; } // let go: the string stays where it is
+      if(!h.pinch&&d<.28){ h.pinch=true; h.grab=tryGrab(pp)||createWire(pp); }
+      else if(h.pinch&&d>.42){ h.pinch=false; releaseGrab(h.grab); h.grab=null; } // let go: the string stays where it is
       if(h.grab) moveGrab(h.grab,pp);
       for(const k of [8,12,16]){ const p=fp(h.tips[k],f.lm[k].x,f.lm[k].y,now);
         const tr=h.trails[k]; tr.push(p); if(tr.length>12) tr.shift();
@@ -574,45 +618,59 @@ function loop(now){
         checkPluck(side+k,p); }
     }
   }
-  A={x:ends.a.x*W,y:ends.a.y*H}; B={x:ends.b.x*W,y:ends.b.y*H};
-
-  const L=Math.hypot(B.x-A.x,B.y-A.y), root=rootMidi(L), iv=intervals(), mul=SOUNDS[soundIdx].mul;
-  strs.forEach((s,i)=>{ s.midi=root+iv[i]; s.phase+=(6+(s.midi-40)*.35)*.1; s.amp*=.968; });
-  const fs=strs.map(s=>mtof(s.midi)*mul); while(fs.length<4) fs.push(fs[0]);
-  if(nStrings<5){ fs[4]=mtof(root+7)*mul; fs[5]=mtof(root+12)*mul; }
+  active=Math.min(active,wires.length-1);
+  const ga=geom(wires[active]); A=ga.a; B=ga.b;
+  const mul=SOUNDS[soundIdx].mul;
+  // every string tunes itself from its own length: shorter is higher
+  wires.forEach(w=>{ w.midi=rootMidi(geom(w).L)+wireIv(w); w.phase+=(6+(w.midi-40)*.35)*.1; w.amp*=.968; });
+  const fs=wires.map(w=>mtof(w.midi)*mul); while(fs.length<6) fs.push(fs[0]);
+  if(wires.length<5){ fs[4]=mtof(wires[active].midi+7)*mul; fs[5]=mtof(wires[active].midi+12)*mul; }
   if(node) node.port.postMessage({t:'f',f:fs});
 
   // ---- GPU pass ----
   const hasVid=!freeMode&&video.readyState>=2;
   if(hasVid){ gl.bindTexture(gl.TEXTURE_2D,vidTex); gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,video); }
-  const pad6=f=>{ const a=new Float32Array(6); strs.forEach((s,i)=>a[i]=f(s)); return a; };
+  const pad6=f=>{ const a=new Float32Array(6); wires.forEach((s,i)=>a[i]=f(s)); return a; };
+  const sa=new Float32Array(12), sb=new Float32Array(12); wires.forEach((w,i)=>{ const g=geom(w); sa.set([g.a.x,g.a.y],i*2); sb.set([g.b.x,g.b.y],i*2); });
   const rip=new Float32Array(32).fill(-1);
   ripples.forEach((r,k)=>{ rip.set([r.x,r.y,(now-r.t)/1000,r.hue/360],k*4); });
-  const grabbed=key=>[hands.L.grab,hands.R.grab,mouseGrab].some(g=>g&&(g.key===key||g.key==='both'))?1:0;
   gl.uniform2f(Uf('uRes'),glc.width,glc.height); gl.uniform1f(Uf('uPx'),glPx);
-  gl.uniform1f(Uf('uT'),t); gl.uniform1f(Uf('uU'),U); gl.uniform1f(Uf('uN'),nStrings); gl.uniform1f(Uf('uStyle'),soundIdx);
+  gl.uniform1f(Uf('uT'),t); gl.uniform1f(Uf('uU'),U); gl.uniform1f(Uf('uN'),wires.length); gl.uniform1f(Uf('uStyle'),soundIdx);
   gl.uniform1f(Uf('uEnergy'),energy); gl.uniform1f(Uf('uLevel'),level); gl.uniform1f(Uf('uFieldHue'),fieldHueS/360);
   gl.uniform1f(Uf('uHasVid'),hasVid?1:0); gl.uniform1f(Uf('uFlash'),styleFlash);
-  gl.uniform2f(Uf('uA'),A.x,A.y); gl.uniform2f(Uf('uB'),B.x,B.y); gl.uniform2f(Uf('uGrab'),grabbed('a'),grabbed('b'));
+  gl.uniform2f(Uf('uA'),A.x,A.y); gl.uniform2f(Uf('uB'),B.x,B.y);
+  gl.uniform2fv(Uf('uSA'),sa); gl.uniform2fv(Uf('uSB'),sb); gl.uniform1fv(Uf('uHeld'),new Float32Array(wires.map((_,i)=>isHeld(i)?1:0).concat([0,0,0,0,0,0]).slice(0,6)));
   gl.uniform1fv(Uf('uAmp'),pad6(s=>s.amp)); gl.uniform1fv(Uf('uPhase'),pad6(s=>s.phase));
   gl.uniform1fv(Uf('uHue'),pad6(s=>noteHue(s.midi)/360)); gl.uniform1fv(Uf('uPos'),pad6(s=>s.pos));
   gl.uniform4fv(Uf('uRip'),rip);
   gl.uniform4f(Uf('uVidR'),vX,vY,(video.videoWidth||1280)*vS,(video.videoHeight||720)*vS);
-  gl.uniform1f(Uf('uGap'),gapU()); updateFFT();
+  updateFFT();
   gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
 
   // ---- overlay ----
   ctx.clearRect(0,0,W,H);
-  const hue0=noteHue(strs[0].midi);
   ctx.save(); ctx.globalCompositeOperation='lighter';
   // a fingertip near the string draws sparks to it before you play
   for(const side of ['L','R']){ const h=hands[side]; if(!h.lm||h.grab||now-h.lastSeen>HOLD) continue;
     for(const k of [8,12]){ if(h.pinch&&k===8) continue; const p=h.tips[k].v; if(!p) continue;
-      const dx=B.x-A.x, dy=B.y-A.y, L2=dx*dx+dy*dy||1, u=Math.max(0,Math.min(1,((p.x-A.x)*dx+(p.y-A.y)*dy)/L2));
-      const q={x:A.x+dx*u,y:A.y+dy*u}, dd=Math.hypot(q.x-p.x,q.y-p.y);
-      if(dd<U*8&&Math.random()<.6) zapWhite(p,q,.6*(1-dd/(U*8))); } }
-  strs.forEach((s,i)=>{ if(s.amp<.08) return; const g=stringGeom(i);
-    for(let k=0;k<3;k++){ const u=Math.random(); sparks.push({x:g.a.x+(g.b.x-g.a.x)*u,y:g.a.y+(g.b.y-g.a.y)*u,vx:(Math.random()-.5)*U*.08,vy:-U*(.05+Math.random()*.14),life:.7*s.amp,hue:noteHue(s.midi)+Math.random()*60}); } });
+      let q=null, dd=U*8;
+      for(const w of wires){ const g=geom(w), dx=g.b.x-g.a.x, dy=g.b.y-g.a.y, L2=dx*dx+dy*dy||1, u=Math.max(0,Math.min(1,((p.x-g.a.x)*dx+(p.y-g.a.y)*dy)/L2));
+        const c={x:g.a.x+dx*u,y:g.a.y+dy*u}, d=Math.hypot(c.x-p.x,c.y-p.y); if(d<dd){ dd=d; q=c; } }
+      if(q&&Math.random()<.6) zapWhite(p,q,.6*(1-dd/(U*8))); } }
+  wires.forEach(w=>{ if(w.amp<.08) return; const g=geom(w);
+    for(let k=0;k<3;k++){ const u=Math.random(); sparks.push({x:g.a.x+(g.b.x-g.a.x)*u,y:g.a.y+(g.b.y-g.a.y)*u,vx:(Math.random()-.5)*U*.08,vy:-U*(.05+Math.random()*.14),life:.7*w.amp,hue:noteHue(w.midi)+Math.random()*60}); }
+    // a high string keeps shimmering with little stars while it rings
+    const hi=Math.max(0,Math.min(1,(w.midi-62)/22));
+    if(Math.random()<hi*w.amp*1.4){ const u=Math.random(); glints.push({x:g.a.x+(g.b.x-g.a.x)*u+(Math.random()-.5)*U*3,y:g.a.y+(g.b.y-g.a.y)*u+(Math.random()-.5)*U*3,vx:0,vy:-U*.04,life:.9,size:U*(.5+Math.random()*.9),tw:Math.random()*6.28,hue:noteHue(w.midi)}); } });
+  // glitter: four-point stars that twinkle and drift up
+  for(let i=glints.length-1;i>=0;i--){ const g=glints[i]; g.x+=g.vx; g.y+=g.vy; g.vx*=.96; g.vy*=.98; g.life-=.012; g.tw+=.35;
+    if(g.life<=0){ glints.splice(i,1); continue; }
+    const a=g.life*(.55+.45*Math.sin(g.tw)), r=g.size*(.7+.3*Math.sin(g.tw));
+    ctx.fillStyle=hsl(g.hue,60,92,a);
+    ctx.beginPath(); ctx.moveTo(g.x,g.y-r); ctx.lineTo(g.x+r*.16,g.y-r*.16); ctx.lineTo(g.x+r,g.y); ctx.lineTo(g.x+r*.16,g.y+r*.16);
+    ctx.lineTo(g.x,g.y+r); ctx.lineTo(g.x-r*.16,g.y+r*.16); ctx.lineTo(g.x-r,g.y); ctx.lineTo(g.x-r*.16,g.y-r*.16); ctx.closePath(); ctx.fill();
+    ctx.fillStyle=`rgba(255,255,255,${a})`; ctx.beginPath(); ctx.arc(g.x,g.y,r*.14,0,7); ctx.fill(); }
+  if(glints.length>500) glints.splice(0,glints.length-500);
   for(let i=sparks.length-1;i>=0;i--){ const p=sparks[i]; p.x+=p.vx; p.y+=p.vy; p.vx*=.95; p.vy*=.95; p.life-=.022;
     if(p.life<=0){ sparks.splice(i,1); continue; } ctx.fillStyle=hsl(p.hue,45,85,p.life); const s=U*.35; ctx.fillRect(p.x-s/2,p.y-s/2,s,s); }
   if(sparks.length>1200) sparks.splice(0,sparks.length-1200);
@@ -621,7 +679,10 @@ function loop(now){
 
   const cx=(A.x+B.x)/2, cy=(A.y+B.y)/2, ang=Math.atan2(B.y-A.y,B.x-A.x), nx=Math.sin(ang), ny=-Math.cos(ang);
   ctx.font=`${Math.round(U*1.8)}px ui-monospace, Menlo, monospace`; ctx.textAlign='center'; ctx.textBaseline='middle';
-  ctx.fillStyle='rgba(255,255,255,.8)'; ctx.fillText(noteName(strs[0].midi), cx+nx*U*(9+nStrings*1.2), cy+ny*U*(9+nStrings*1.2));
+  ctx.fillStyle='rgba(255,255,255,.8)'; ctx.fillText(noteName(wires[active].midi), cx+nx*U*7, cy+ny*U*7);
+  ctx.font=`${Math.round(U*1.4)}px ui-monospace, Menlo, monospace`; ctx.fillStyle='rgba(255,255,255,.45)';
+  wires.forEach((w,i)=>{ if(i===active) return; const g=geom(w); if(g.L<U*6) return; const mx=(g.a.x+g.b.x)/2, my=(g.a.y+g.b.y)/2;
+    ctx.fillText(noteName(w.midi), mx-g.nx*U*4, my-g.ny*U*4); });
   if(notePop){ const a=1-(now-notePop.t)/800; if(a<=0) notePop=null; else {
     ctx.font=`${Math.round(U*4.5)}px ui-monospace, Menlo, monospace`; ctx.fillStyle=`rgba(255,255,255,${a})`;
     ctx.fillText(notePop.text, cx-nx*U*(12+(1-a)*3), cy-ny*U*(12+(1-a)*3)); } }

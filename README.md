@@ -8,8 +8,11 @@ A string that hangs in the air in front of your webcam. Swipe a fingertip throug
 
 - One string fixed in the air, so you don't have to hold it
 - Swipe any fingertip (index, middle or ring) through it to pluck. Where you pluck changes the tone, and how fast you pluck changes the volume
-- Pinch near an end to move it, and let go to leave it there. Shorter is higher, longer is lower, and moving it while a note rings bends the pitch
-- Pinch the middle to move the whole string
+- Pinch near an end and stretch it to tune it, then let go to leave it there. Moving it while a note rings bends the pitch
+- **Tension mode (default):** stretching tightens the string like a tuning peg, so longer = higher. Turn it off for **length mode**, where shorter = higher, like fretting a guitar
+- Pinch empty air and pull to draw a brand new string there (up to 6), each tuned by its own length
+- Pinch the middle of a string to move the whole thing
+- High notes throw glitter, and the higher the note, the more stars
 - 1, 3 or 6 strings, tuned as a chord and spaced so you can pick one out
 - Snap to scale (major or minor pentatonic) so it always sounds musical
 - 7 sounds, physically modelled in a Web Audio worklet, each with its own visual:
@@ -32,7 +35,10 @@ A string that hangs in the air in front of your webcam. Swipe a fingertip throug
 | Input | Action |
 | --- | --- |
 | Swipe through the string | Play |
-| Pinch an end / drag an end | Move it, which changes the note |
+| Pinch an end / drag an end | Stretch it, which changes the note |
+| Pinch empty air and pull / shift-drag | Draw a new string |
+| T | Tension vs length mode |
+| C | Clear back to one string |
 | ← → | Change sound |
 | 1, 3, 6 | Number of strings |
 | Space | Strum |
