@@ -64,7 +64,7 @@
     <button class="toggle on" id="tSnap">snap</button>
     <button class="toggle" id="tMinor">minor</button>
   </div>
-  <div class="hint">swipe a fingertip through a string to play · pinch an end and stretch to tune it · pinch empty air and pull to draw a new string · mouse: shift-drag to draw · c clears</div>
+  <div class="hint">swipe a fingertip through a string to play · pinch an end and stretch to tune it · pinch empty air with both hands and pull apart to draw a new string · only index fingers play · mouse: shift-drag to draw · c clears</div>
 </div>
 
 <div id="start">
@@ -97,13 +97,14 @@ let soundIdx=0, nStrings=1, snap=true, minor=false, tension=true;
 // ---------- audio engine ----------
 const WORKLET=`
 const SIZE=8192, MASK=SIZE-1;
-class Voice{ constructor(){ this.buf=new Float32Array(SIZE); this.w=0; this.d=200; this.td=200; this.lp=0; this.ph=0; this.env=0; this.f=220; this.tf=220; this.flp=0; } }
+class Voice{ constructor(){ this.buf=new Float32Array(SIZE); this.w=0; this.d=200; this.td=200; this.lp=0; this.ph=0; this.env=0; this.f=220; this.tf=220; this.flp=0; this.tone=0;
+  this.c={mode:0,bright:.5,damp:.996,env:.9998,drive:0,buzz:0,lpk:.7,wet:.25}; } }
 class Strings extends AudioWorkletProcessor{
-  constructor(){ super(); this.v=Array.from({length:6},()=>new Voice()); this.cfg={mode:0,bright:.5,damp:.996,env:.9998};
+  constructor(){ super(); this.v=Array.from({length:6},()=>new Voice());
     this.port.onmessage=e=>{ const m=e.data;
-      if(m.t==='cfg') this.cfg=m.c;
+      if(m.t==='cfgv'){ const c=m.c; c.lpk=1-Math.exp(-2*Math.PI*c.lp/sampleRate); this.v[m.i].c=c; }
       else if(m.t==='f') m.f.forEach((f,i)=>{ const v=this.v[i]; v.tf=f; v.td=Math.min(SIZE-2,sampleRate/f); });
-      else if(m.t==='pluck'){ const v=this.v[m.i]; const c=this.cfg;
+      else if(m.t==='pluck'){ const v=this.v[m.i]; const c=v.c;
         if(c.mode===0){ v.d=v.td; const N=Math.max(2,Math.round(v.d)); const p=Math.min(.95,Math.max(.05,m.pos));
           for(let k=0;k<N;k++){ const x=k/N; const tri=x<p?x/p:(1-x)/(1-p);
             const idx=(v.w-N+k+SIZE)&MASK; v.buf[idx]+=((tri-.5)*.9+(Math.random()*2-1)*.45)*m.vel; } }
@@ -111,64 +112,61 @@ class Strings extends AudioWorkletProcessor{
       } };
   }
   process(_,outputs){
-    const out=outputs[0], L=out[0]; const c=this.cfg;
+    const dry=outputs[0], wet=outputs[1], L=dry[0];
     for(let n=0;n<L.length;n++){
-      let sum=0;
-      for(const v of this.v){
+      let sd=0, sw=0;
+      for(const v of this.v){ const c=v.c; let s=0;
         if(c.mode===0){
           v.d+=(v.td-v.d)*.0015;
           let r=v.w-v.d; if(r<0) r+=SIZE; const i0=r|0, fr=r-i0;
-          const s=v.buf[i0]*(1-fr)+v.buf[(i0+1)&MASK]*fr;
-          v.lp+=c.bright*(s-v.lp); v.buf[v.w]=v.lp*c.damp; v.w=(v.w+1)&MASK; sum+=s;
+          s=v.buf[i0]*(1-fr)+v.buf[(i0+1)&MASK]*fr;
+          v.lp+=c.bright*(s-v.lp); v.buf[v.w]=v.lp*c.damp; v.w=(v.w+1)&MASK;
         } else if(v.env>1e-4){
           v.f+=(v.tf-v.f)*.002; v.ph+=v.f/sampleRate; if(v.ph>=1) v.ph-=1;
-          const s=2*v.ph-1; v.flp+=(.03+v.env*.45)*(s-v.flp); sum+=v.flp*v.env; v.env*=c.env;
-        }
+          const x=2*v.ph-1; v.flp+=(.03+v.env*.45)*(x-v.flp); s=v.flp*v.env; v.env*=c.env;
+        } else continue;
+        if(c.buzz) s = s>0 ? s : s*.55+.08*Math.sin(s*40)*Math.abs(s);           // sitar bridge buzz
+        if(c.drive>0) s=Math.tanh(s*(1+c.drive))/Math.tanh(1+c.drive);            // rock distortion
+        v.tone+=c.lpk*(s-v.tone); s=v.tone;                                        // per-sound tone
+        sd+=s*(1-c.wet*.5); sw+=s*c.wet;
       }
-      sum*=.6; for(let ch=0;ch<out.length;ch++) out[ch][n]=sum;
+      sd*=.6; sw*=.6;
+      for(let ch=0;ch<dry.length;ch++) dry[ch][n]=sd;
+      for(let ch=0;ch<wet.length;ch++) wet[ch][n]=sw;
     }
     return true;
   }
 }
 registerProcessor('strings',Strings);`;
-let ac, node, shaper, lowpass, wetG, dryG, an, anBuf, level=0;
+let ac, node, an, anBuf, level=0;
 async function initAudio(){
   if(ac) return;
   ac=new AudioContext({ latencyHint:'interactive' });
   await ac.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET],{type:'application/javascript'})));
-  node=new AudioWorkletNode(ac,'strings',{ outputChannelCount:[2] });
+  node=new AudioWorkletNode(ac,'strings',{ numberOfOutputs:2, outputChannelCount:[2,2] });
   const body=ac.createBiquadFilter(); body.type='peaking'; body.frequency.value=190; body.Q.value=1.1; body.gain.value=4;
   const pres=ac.createBiquadFilter(); pres.type='peaking'; pres.frequency.value=2600; pres.Q.value=.9; pres.gain.value=2.5;
-  shaper=ac.createWaveShaper(); shaper.oversample='4x';
-  lowpass=ac.createBiquadFilter(); lowpass.type='lowpass'; lowpass.Q.value=.7;
   const rev=ac.createConvolver(); rev.buffer=impulse(2.8);
-  wetG=ac.createGain(); dryG=ac.createGain();
   const comp=ac.createDynamicsCompressor(); comp.threshold.value=-14; comp.ratio.value=4;
   const master=ac.createGain(); master.gain.value=1.6;
   const lim=ac.createDynamicsCompressor(); lim.threshold.value=-3; lim.knee.value=0; lim.ratio.value=20; lim.attack.value=.001; lim.release.value=.12;
   const out=ac.createGain(); out.gain.value=.9;
-  node.connect(body); body.connect(pres); pres.connect(shaper); shaper.connect(lowpass);
-  lowpass.connect(dryG); lowpass.connect(rev); rev.connect(wetG);
-  dryG.connect(comp); wetG.connect(comp); comp.connect(master); master.connect(lim); lim.connect(out); out.connect(ac.destination);
+  node.connect(body,0); body.connect(pres); pres.connect(comp);   // dry: through the wooden-body colour
+  node.connect(rev,1); rev.connect(comp);                         // wet: each string's own reverb send
+  comp.connect(master); master.connect(lim); lim.connect(out); out.connect(ac.destination);
   an=ac.createAnalyser(); an.fftSize=1024; out.connect(an); anBuf=new Float32Array(an.fftSize);
   window.airLevel=()=>{ an.getFloatTimeDomainData(anBuf); let p=0; for(const v of anBuf) p=Math.max(p,Math.abs(v)); return { state:ac.state, peak:+p.toFixed(3) }; };
-  applySound();
+  syncVoices();
 }
 function impulse(sec){ const len=ac.sampleRate*sec, b=ac.createBuffer(2,len,ac.sampleRate);
   for(let c=0;c<2;c++){ const d=b.getChannelData(c); for(let i=0;i<len;i++) d[i]=(Math.random()*2-1)*Math.pow(1-i/len,3); } return b; }
-function curve(drive,buzz){ const n=2048, c=new Float32Array(n);
-  for(let i=0;i<n;i++){ let x=i/(n-1)*2-1;
-    if(buzz) x = x>0 ? x : x*.55 + .08*Math.sin(x*40)*Math.abs(x);
-    c[i]= drive>0 ? Math.tanh(x*(1+drive))/Math.tanh(1+drive) : x; }
-  return c; }
-function applySound(){
-  const s=SOUNDS[soundIdx];
+const voiceCfg=s=>({ mode:s.mode, bright:s.bright||.5, damp:s.damp||.996, env:s.env||.9998, drive:s.drive, buzz:s.buzz, lp:s.lp, wet:s.wet });
+// every string keeps the sound it was made with; voices 4 and 5 are the rock power-chord helpers
+function syncVoices(){
   document.querySelectorAll('#sounds button').forEach((b,i)=>b.classList.toggle('on',i===soundIdx));
-  if(!ac) return;
-  node.port.postMessage({ t:'cfg', c:{ mode:s.mode, bright:s.bright||.5, damp:s.damp||.996, env:s.env||.9998 } });
-  shaper.curve=curve(s.drive,s.buzz);
-  lowpass.frequency.setTargetAtTime(s.lp,ac.currentTime,.02);
-  wetG.gain.setTargetAtTime(s.wet,ac.currentTime,.05); dryG.gain.setTargetAtTime(1-s.wet*.5,ac.currentTime,.05);
+  if(!node) return;
+  for(let i=0;i<6;i++){ const w=wires[i]||((i>=4&&wires.length<5)?wires[active]:null);
+    node.port.postMessage({ t:'cfgv', i, c:voiceCfg(SOUNDS[w?w.sound:soundIdx]) }); }
 }
 
 // ---------- pitch + colour ----------
@@ -208,7 +206,7 @@ let sparks=[], glints=[], ripples=[], notePop=null, fieldHue=270, fieldHueS=270,
 const pluckers=new Map();
 const STYLE_NAMES=['silk','spectrum','silk flame','mandala','iridescent','prism','pastel smear'];
 const MAXW=6; // one audio voice per string
-const mkWire=(a,b,preset=0,ci=0)=>({a,b,preset,ci,amp:0,pos:.5,lastPluck:0,midi:57,phase:Math.random()*6});
+const mkWire=(a,b,preset=0,ci=0)=>({a,b,preset,ci,sound:soundIdx,amp:0,pos:.5,lastPluck:0,midi:57,phase:Math.random()*6});
 function geom(w){ const a={x:w.a.x*W,y:w.a.y*H}, b={x:w.b.x*W,y:w.b.y*H}; const dx=b.x-a.x, dy=b.y-a.y, L=Math.hypot(dx,dy)||1; return {a,b,nx:-dy/L,ny:dx/L,L}; }
 const chordFor=n=>{ const c=CHORDS[n].slice(); if(minor&&n===6) c[3]=15; return c; };
 const wireIv=w=>w.preset?chordFor(w.preset)[w.ci]:0;
@@ -221,13 +219,14 @@ function setStrings(n){
     return mkWire({x:base.a.x+ox,y:base.a.y+oy},{x:base.b.x+ox,y:base.b.y+oy},n>1?n:0,i); });
   active=0; hands.L.grab=hands.R.grab=mouseGrab=null;
   document.querySelectorAll('#strings button').forEach(b=>b.classList.toggle('on',+b.dataset.n===n));
+  syncVoices();
 }
 function pluck(i,pos,vel){
   const w=wires[i]; if(!w) return; const now=performance.now(); if(now-w.lastPluck<80) return; w.lastPluck=now;
   w.amp=Math.min(1,.35+vel); w.pos=pos; active=i;
   const v=Math.min(1,.3+vel*.9);
   if(node){ node.port.postMessage({t:'pluck',i,pos,vel:v});
-    if(SOUNDS[soundIdx].power&&wires.length===1){ node.port.postMessage({t:'pluck',i:4,pos,vel:v*.8}); node.port.postMessage({t:'pluck',i:5,pos,vel:v*.6}); } }
+    if(SOUNDS[w.sound].power&&wires.length===1){ syncVoices(); node.port.postMessage({t:'pluck',i:4,pos,vel:v*.8}); node.port.postMessage({t:'pluck',i:5,pos,vel:v*.6}); } }
   const g=geom(w), p={x:g.a.x+(g.b.x-g.a.x)*pos, y:g.a.y+(g.b.y-g.a.y)*pos}, hue=noteHue(w.midi);
   for(let k=0;k<22;k++){ const a=Math.random()*6.28, sp=U*(.15+Math.random()*1.1)*(.5+vel); sparks.push({x:p.x,y:p.y,vx:Math.cos(a)*sp,vy:Math.sin(a)*sp,life:1,hue:hue+Math.random()*70-35}); }
   // high notes throw glitter: the higher the pitch, the more stars
@@ -237,7 +236,7 @@ function pluck(i,pos,vel){
   ripples.push({x:p.x,y:p.y,t:now,hue}); if(ripples.length>8) ripples.shift();
   energy=Math.min(2.4,energy+.7+vel); fieldHue=hue;
   notePop={ text:noteName(w.midi), t:now, hue };
-  document.getElementById('note').textContent=noteName(w.midi)+' · '+SOUNDS[soundIdx].name;
+  document.getElementById('note').textContent=noteName(w.midi)+' · '+SOUNDS[w.sound].name;
 }
 function checkPluck(id,p){
   const prev=pluckers.get(id); pluckers.set(id,p); if(!prev) return;
@@ -267,15 +266,18 @@ function tryGrab(p){
   return null;
 }
 // pinching empty air starts a new string at that spot; stretching pulls out its other end
-function createWire(p){
+function createWire(p,q){
   if(wires.length>=MAXW){ document.getElementById('note').textContent='6 strings max · press 1 to reset'; return null; }
-  const at={x:clamp01(p.x/W),y:clamp01(p.y/H)};
-  wires.push(mkWire({...at},{...at})); active=wires.length-1;
+  const at=v=>({x:clamp01(v.x/W),y:clamp01(v.y/H)});
+  wires.push(mkWire(at(p),at(q||p))); active=wires.length-1; syncVoices();
   return {w:wires.length-1,key:'b',creating:true};
 }
 function removeWire(i){
   wires.splice(i,1);
+  for(const h of [hands.L,hands.R]) if(h.grab&&h.grab.w===i) h.grab=null;
+  if(mouseGrab&&mouseGrab.w===i) mouseGrab=null;
   for(const g of allGrabs()) if(g.w>i) g.w--;
+  syncVoices();
   active=Math.min(active,wires.length-1);
   if(!wires.length) setStrings(1);
 }
@@ -452,8 +454,8 @@ void main(){
 
   col=1.-exp(-col*1.3);
   vec3 bg=vec3(0.);
-  if(uHasVid>.5){ vec2 tv=vec2(1.-(p.x-uVidR.x)/uVidR.z,(p.y-uVidR.y)/uVidR.w); bg=texture2D(uVid,tv).rgb*.4; }
-  vec3 outc=bg+col*(1.-bg*.5)+vec3(uFlash)*.15;
+  if(uHasVid>.5){ vec2 tv=vec2(1.-(p.x-uVidR.x)/uVidR.z,(p.y-uVidR.y)/uVidR.w); bg=texture2D(uVid,tv).rgb*.92; }
+  vec3 outc=bg*(1.-clamp(dot(col,vec3(.33))*.6,0.,.6))+col+vec3(uFlash)*.15;
   gl_FragColor=vec4(outc,1.);
 }`;
 const VS=`attribute vec2 p; void main(){ gl_Position=vec4(p,0.,1.); }`;
@@ -540,7 +542,8 @@ addEventListener('pointerup',e=>{ releaseGrab(mouseGrab); mouseGrab=null; plucke
 
 // ---------- UI ----------
 document.getElementById('sounds').innerHTML=SOUNDS.map((s,i)=>`<button class="chip" data-i="${i}">${s.name}</button>`).join('');
-const pickSound=i=>{ soundIdx=i; applySound(); styleFlash=1; document.getElementById('note').textContent=SOUNDS[i].name+' · '+STYLE_NAMES[i]; };
+// picking a sound sets it for new strings and for the string you last played; other strings keep theirs
+const pickSound=i=>{ soundIdx=i; if(wires[active]) wires[active].sound=i; syncVoices(); styleFlash=1; document.getElementById('note').textContent=SOUNDS[i].name+' · '+STYLE_NAMES[i]; };
 document.querySelectorAll('#sounds button').forEach(b=>b.onclick=()=>pickSound(+b.dataset.i));
 const shiftSound=d=>{ pickSound((soundIdx+d+SOUNDS.length)%SOUNDS.length); document.querySelectorAll('#sounds button')[soundIdx].scrollIntoView({inline:'center',block:'nearest'}); };
 document.getElementById('prev').onclick=()=>shiftSound(-1);
@@ -549,7 +552,7 @@ document.querySelectorAll('#strings button').forEach(b=>b.onclick=()=>setStrings
 document.getElementById('tTension').onclick=e=>{ tension=!tension; e.currentTarget.classList.toggle('on',tension); document.getElementById('note').textContent=tension?'tension · stretch to go higher':'length · shorter is higher'; };
 document.getElementById('tSnap').onclick=e=>{ snap=!snap; e.currentTarget.classList.toggle('on',snap); };
 document.getElementById('tMinor').onclick=e=>{ minor=!minor; e.currentTarget.classList.toggle('on',minor); };
-applySound();
+syncVoices();
 addEventListener('keydown',e=>{ const k=e.key.toLowerCase();
   if(e.key==='ArrowRight') shiftSound(1); if(e.key==='ArrowLeft') shiftSound(-1);
   if(['1','3','6'].includes(k)) setStrings(+k);
@@ -576,7 +579,7 @@ function drawHand(h,side,t){
   ctx.fillStyle='rgba(255,255,255,.85)';
   for(let j=0;j<21;j++){ ctx.beginPath(); ctx.arc(P[j].x,P[j].y,Math.max(1.3,U*.22),0,7); ctx.fill(); }
   // the fingers that can play: a white dot with a short fading trail, so you can see them drag
-  for(const k of [8,12,16]){ if(h.pinch&&k===8) continue; const tr=h.trails[k]; if(tr.length<2) continue;
+  for(const k of [8]){ if(h.pinch) continue; const tr=h.trails[k]; if(tr.length<2) continue;
     for(let q=1;q<tr.length;q++){ const a=q/tr.length; ctx.beginPath(); ctx.moveTo(tr[q-1].x,tr[q-1].y); ctx.lineTo(tr[q].x,tr[q].y);
       ctx.strokeStyle=`rgba(255,255,255,${a*.5})`; ctx.lineWidth=U*.55*a; ctx.stroke(); }
     const p=tr[tr.length-1];
@@ -604,27 +607,34 @@ function loop(now){
       return { lm:P, size, cx:(P[0].x+P[9].x)/2, cy:(P[0].y+P[9].y)/2 }; });
     const as=assign(found);
     for(const side of ['L','R']){ const h=hands[side], f=as[side];
-      if(!f){ if(now-h.lastSeen>HOLD){ releaseGrab(h.grab); h.grab=null; h.pinch=false; h.lm=null; for(const k in h.trails) h.trails[k]=[]; } continue; }
+      if(!f){ if(now-h.lastSeen>HOLD){ releaseGrab(h.grab); h.grab=null; h.pinch=false; h.waiting=false; h.lm=null; for(const k in h.trails) h.trails[k]=[]; } continue; }
       h.lastSeen=now; h.center={x:f.cx,y:f.cy};
       h.lm=h.lm?f.lm.map((p,i)=>({x:h.lm[i].x+(p.x-h.lm[i].x)*.6,y:h.lm[i].y+(p.y-h.lm[i].y)*.6})):f.lm;
       const th=f.lm[4], ix=f.lm[8], d=Math.hypot(th.x-ix.x,th.y-ix.y)/f.size;
       const pp=fp(h.pinchP,(th.x+ix.x)/2,(th.y+ix.y)/2,now);
-      if(!h.pinch&&d<.28){ h.pinch=true; h.grab=tryGrab(pp)||createWire(pp); }
-      else if(h.pinch&&d>.42){ h.pinch=false; releaseGrab(h.grab); h.grab=null; } // let go: the string stays where it is
+      // one hand pinching near a string grabs it; pinching empty air waits for the other hand to pinch too
+      if(!h.pinch&&d<.28){ h.pinch=true; h.grab=tryGrab(pp); h.waiting=!h.grab; }
+      else if(h.pinch&&d>.42){ h.pinch=false; h.waiting=false; releaseGrab(h.grab); h.grab=null; } // let go: the string stays where it is
       if(h.grab) moveGrab(h.grab,pp);
-      for(const k of [8,12,16]){ const p=fp(h.tips[k],f.lm[k].x,f.lm[k].y,now);
-        const tr=h.trails[k]; tr.push(p); if(tr.length>12) tr.shift();
-        if(h.pinch&&k===8){ pluckers.delete(side+k); continue; }
-        checkPluck(side+k,p); }
+      // only the index fingertip plays, so other fingers can't pluck by accident
+      const p8=fp(h.tips[8],f.lm[8].x,f.lm[8].y,now);
+      const tr=h.trails[8]; tr.push(p8); if(tr.length>12) tr.shift();
+      if(h.pinch) pluckers.delete(side+8); else checkPluck(side+8,p8);
+    }
+    // both hands pinching empty air: a new string stretches between them, each hand holds one end
+    const L_=hands.L, R_=hands.R;
+    if(L_.pinch&&R_.pinch&&L_.waiting&&R_.waiting&&L_.pinchP.v&&R_.pinchP.v){
+      const g=createWire(L_.pinchP.v,R_.pinchP.v);
+      if(g){ L_.grab={w:g.w,key:'a',creating:true}; R_.grab={w:g.w,key:'b',creating:true}; }
+      L_.waiting=R_.waiting=false;
     }
   }
   active=Math.min(active,wires.length-1);
   const ga=geom(wires[active]); A=ga.a; B=ga.b;
-  const mul=SOUNDS[soundIdx].mul;
   // every string tunes itself from its own length: shorter is higher
   wires.forEach(w=>{ w.midi=rootMidi(geom(w).L)+wireIv(w); w.phase+=(6+(w.midi-40)*.35)*.1; w.amp*=.968; });
-  const fs=wires.map(w=>mtof(w.midi)*mul); while(fs.length<6) fs.push(fs[0]);
-  if(wires.length<5){ fs[4]=mtof(wires[active].midi+7)*mul; fs[5]=mtof(wires[active].midi+12)*mul; }
+  const fs=wires.map(w=>mtof(w.midi)*SOUNDS[w.sound].mul); while(fs.length<6) fs.push(fs[0]);
+  if(wires.length<5){ const am=SOUNDS[wires[active].sound].mul; fs[4]=mtof(wires[active].midi+7)*am; fs[5]=mtof(wires[active].midi+12)*am; }
   if(node) node.port.postMessage({t:'f',f:fs});
 
   // ---- GPU pass ----
@@ -635,7 +645,7 @@ function loop(now){
   const rip=new Float32Array(32).fill(-1);
   ripples.forEach((r,k)=>{ rip.set([r.x,r.y,(now-r.t)/1000,r.hue/360],k*4); });
   gl.uniform2f(Uf('uRes'),glc.width,glc.height); gl.uniform1f(Uf('uPx'),glPx);
-  gl.uniform1f(Uf('uT'),t); gl.uniform1f(Uf('uU'),U); gl.uniform1f(Uf('uN'),wires.length); gl.uniform1f(Uf('uStyle'),soundIdx);
+  gl.uniform1f(Uf('uT'),t); gl.uniform1f(Uf('uU'),U); gl.uniform1f(Uf('uN'),wires.length); gl.uniform1f(Uf('uStyle'),wires[active].sound);
   gl.uniform1f(Uf('uEnergy'),energy); gl.uniform1f(Uf('uLevel'),level); gl.uniform1f(Uf('uFieldHue'),fieldHueS/360);
   gl.uniform1f(Uf('uHasVid'),hasVid?1:0); gl.uniform1f(Uf('uFlash'),styleFlash);
   gl.uniform2f(Uf('uA'),A.x,A.y); gl.uniform2f(Uf('uB'),B.x,B.y);
@@ -652,7 +662,7 @@ function loop(now){
   ctx.save(); ctx.globalCompositeOperation='lighter';
   // a fingertip near the string draws sparks to it before you play
   for(const side of ['L','R']){ const h=hands[side]; if(!h.lm||h.grab||now-h.lastSeen>HOLD) continue;
-    for(const k of [8,12]){ if(h.pinch&&k===8) continue; const p=h.tips[k].v; if(!p) continue;
+    for(const k of [8]){ if(h.pinch) continue; const p=h.tips[k].v; if(!p) continue;
       let q=null, dd=U*8;
       for(const w of wires){ const g=geom(w), dx=g.b.x-g.a.x, dy=g.b.y-g.a.y, L2=dx*dx+dy*dy||1, u=Math.max(0,Math.min(1,((p.x-g.a.x)*dx+(p.y-g.a.y)*dy)/L2));
         const c={x:g.a.x+dx*u,y:g.a.y+dy*u}, d=Math.hypot(c.x-p.x,c.y-p.y); if(d<dd){ dd=d; q=c; } }
